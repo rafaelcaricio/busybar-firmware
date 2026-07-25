@@ -73,6 +73,7 @@ static struct {
     uint8_t mouse_key;
     bool mouse_down;
     bool selftest_pending;
+    bool screenshot_pending;
 
     /* Whole-window capture. The pixels can only be read on the SDL thread, but
      * the PNG encoder allocates from furi's heap and so has to run in a task;
@@ -457,6 +458,12 @@ bool sim_window_pump(void) {
                 return false;
             }
 
+            /* Not a device button, so it is handled here rather than mapped. */
+            if(event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_F12) {
+                sim_window_request_screenshot();
+                continue;
+            }
+
             const uint8_t key = sim_window_map_key(event.key.keysym.sym);
             if(key != InputKeyMAX) {
                 pthread_mutex_lock(&sim.lock);
@@ -562,25 +569,51 @@ static void sim_window_write_png(
     size_t width,
     size_t height,
     int scale) {
-    uint8_t* scaled = malloc(width * height * scale * scale * 3);
-    if(!scaled) return;
+    uint8_t* scaled = NULL;
 
-    for(size_t y = 0; y < height * (size_t)scale; y++) {
-        for(size_t x = 0; x < width * (size_t)scale; x++) {
-            const size_t src = ((y / scale) * width + (x / scale)) * 3;
-            const size_t dst = (y * width * scale + x) * 3;
-            scaled[dst + 0] = rgb[src + 0];
-            scaled[dst + 1] = rgb[src + 1];
-            scaled[dst + 2] = rgb[src + 2];
+    if(scale > 1) {
+        scaled = malloc(width * height * scale * scale * 3);
+        if(!scaled) return;
+
+        for(size_t y = 0; y < height * (size_t)scale; y++) {
+            for(size_t x = 0; x < width * (size_t)scale; x++) {
+                const size_t src = ((y / scale) * width + (x / scale)) * 3;
+                const size_t dst = (y * width * scale + x) * 3;
+                scaled[dst + 0] = rgb[src + 0];
+                scaled[dst + 1] = rgb[src + 1];
+                scaled[dst + 2] = rgb[src + 2];
+            }
         }
     }
+
+    /* Tuned for capture rate rather than file size. A whole-window shot is
+     * four megapixels; at lodepng's defaults — every scanline filtered five
+     * ways and a 2048-byte match window — that is five seconds an image, and
+     * the point of on-demand capture is to take them in a loop. Filtering up
+     * and a short window costs about a third more bytes on disk. */
+    LodePNGState state;
+    lodepng_state_init(&state);
+    state.info_raw.colortype = LCT_RGB;
+    state.info_raw.bitdepth = 8;
+    state.info_png.color.colortype = LCT_RGB;
+    state.info_png.color.bitdepth = 8;
+    state.encoder.auto_convert = 0;
+    state.encoder.filter_strategy = LFS_TWO;
+    state.encoder.zlibsettings.windowsize = 256;
 
     /* LVGL's lodepng fork routes *_file() through lv_fs, so encode to memory
      * and write the bytes here instead. */
     uint8_t* png = NULL;
     size_t png_size = 0;
-    const unsigned error = lodepng_encode24(
-        &png, &png_size, scaled, (unsigned)(width * scale), (unsigned)(height * scale));
+    const unsigned error = lodepng_encode(
+        &png,
+        &png_size,
+        scaled ? scaled : rgb,
+        (unsigned)(width * scale),
+        (unsigned)(height * scale),
+        &state);
+
+    lodepng_state_cleanup(&state);
 
     if(error) {
         fprintf(stderr, "[sim] png encode failed for %s: %u\n", path, error);
@@ -602,6 +635,21 @@ void sim_window_request_selftest(void) {
     sim.selftest_pending = true;
 }
 
+void sim_window_request_screenshot(void) {
+    pthread_mutex_lock(&sim.lock);
+    sim.screenshot_pending = true;
+    pthread_mutex_unlock(&sim.lock);
+}
+
+bool sim_window_take_screenshot_request(void) {
+    pthread_mutex_lock(&sim.lock);
+    const bool pending = sim.screenshot_pending;
+    sim.screenshot_pending = false;
+    pthread_mutex_unlock(&sim.lock);
+
+    return pending;
+}
+
 void sim_window_inject_key(uint8_t key, bool pressed) {
     pthread_mutex_lock(&sim.lock);
     sim_window_set_key(key, pressed);
@@ -614,11 +662,25 @@ void sim_window_request_quit(void) {
     pthread_mutex_unlock(&sim.lock);
 }
 
+/** Build "<directory>/<name>.png", numbered when @p sequence is not zero. */
+static void sim_window_capture_path(
+    char* path,
+    size_t size,
+    const char* directory,
+    const char* name,
+    unsigned sequence) {
+    if(sequence) {
+        snprintf(path, size, "%s/%s-%03u.png", directory, name, sequence);
+    } else {
+        snprintf(path, size, "%s/%s.png", directory, name);
+    }
+}
+
 /** Ask the SDL thread for the composited window and write it out.
  *
- * Unlike the per-panel images this shows the layout itself — bezels, relative
- * sizes, spacing — which is the only way to check the window presentation. */
-static void sim_window_capture_window(const char* directory) {
+ * Unlike the per-panel images this shows the device and the layout around the
+ * panels, which is the only way to check the window presentation. */
+static void sim_window_capture_window(const char* directory, unsigned sequence) {
     pthread_mutex_lock(&sim.lock);
     const int width = sim.canvas_w;
     const int height = sim.canvas_h;
@@ -648,7 +710,7 @@ static void sim_window_capture_window(const char* directory) {
 
     if(done) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s/window.png", directory);
+        sim_window_capture_path(path, sizeof(path), directory, "window", sequence);
         sim_window_write_png(path, pixels, (size_t)width, (size_t)height, 1);
     } else {
         fprintf(stderr, "[sim] window capture timed out\n");
@@ -662,7 +724,7 @@ static void sim_window_capture_window(const char* directory) {
     free(pixels);
 }
 
-void sim_window_screenshot(const char* directory) {
+void sim_window_screenshot(const char* directory, unsigned sequence) {
     uint8_t front_rgb[sizeof(sim.front_pixels)];
     uint8_t back_rgb[BACK_DISPLAY_W * BACK_DISPLAY_H * 3];
 
@@ -683,13 +745,14 @@ void sim_window_screenshot(const char* directory) {
 
     char path[1024];
 
-    snprintf(path, sizeof(path), "%s/front.png", directory);
+    sim_window_capture_path(path, sizeof(path), directory, "front", sequence);
     sim_window_write_png(path, front_rgb, FRONT_DISPLAY_W, FRONT_DISPLAY_H, sim.front_scale);
 
-    snprintf(path, sizeof(path), "%s/back.png", directory);
+    sim_window_capture_path(path, sizeof(path), directory, "back", sequence);
     sim_window_write_png(path, back_rgb, BACK_DISPLAY_W, BACK_DISPLAY_H, sim.back_scale);
 
-    sim_window_capture_window(directory);
+    sim_window_capture_window(directory, sequence);
 
-    fprintf(stderr, "[sim] wrote screenshots to %s\n", directory);
+    sim_window_capture_path(path, sizeof(path), directory, "window", sequence);
+    fprintf(stderr, "[sim] wrote %s and its two panels\n", path);
 }

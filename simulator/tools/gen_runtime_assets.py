@@ -19,6 +19,7 @@ Layout produced, mirroring the device:
     <root>/ext/apps_assets/<app>/animations   <- assets/animations/<app>
     <root>/ext/apps_assets/shared/sounds      <- assets/shared/sounds
     <root>/ext/apps_assets/<app>/sounds       <- assets/sounds/<app>
+    <root>/ext                                <- applications/*/*/resources
 
 Conversions are skipped when the output is newer than its source, so
 reconfiguring does not redo the whole tree.
@@ -135,6 +136,31 @@ def convert_animations(source_dir: Path, target_dir: Path) -> tuple[int, int]:
     return converted, failed
 
 
+def copy_app_resources(root: Path) -> int:
+    """Install every applications/*/resources tree, which ships as it is.
+
+    These are files an app reads at runtime but that no converter produces —
+    the busy app's themes, matter's certificates, the web server's 404 page.
+    Each `resources` directory mirrors the device's `/ext` below it, so
+    resources/apps_assets/busy/themes/on_air/theme.json is exactly
+    /ext/apps_assets/busy/themes/on_air/theme.json.
+    """
+    ext = root / "ext"
+    copied = 0
+
+    for resources in sorted(REPO_ROOT.glob("applications/*/*/resources")):
+        for source in sorted(p for p in resources.rglob("*") if p.is_file()):
+            target = ext / source.relative_to(resources)
+            if not is_stale(source, target):
+                continue
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            copied += 1
+
+    return copied
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True, help="Asset root to populate")
@@ -184,7 +210,10 @@ def main() -> int:
 
     anim_failures += sound_failures
 
-    print(f"assets: {images} shared images, {app_images} app images, {anims} animations, {sounds} sounds"
+    resources = copy_app_resources(args.root)
+
+    print(f"assets: {images} shared images, {app_images} app images, {anims} animations, "
+          f"{sounds} sounds, {resources} app resources"
           + (f", {anim_failures} conversion failures" if anim_failures else ""))
     return 0
 

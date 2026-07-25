@@ -36,6 +36,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 
 #define FRAME_DELAY_US (16000)
@@ -158,8 +159,72 @@ static int32_t simulator_capture_thread(void* context) {
 
     if(config.keys) simulator_replay_keys(config.keys);
 
-    if(config.screenshot_dir) sim_window_screenshot(config.screenshot_dir);
+    if(config.screenshot_dir) sim_window_screenshot(config.screenshot_dir, 0);
     sim_window_request_quit();
+
+    return 0;
+}
+
+/** Where a capture asked for while the simulator runs is written. */
+static const char* simulator_screenshot_dir(void) {
+    return config.screenshot_dir ? config.screenshot_dir : ".";
+}
+
+static volatile sig_atomic_t simulator_screenshot_signalled;
+
+static void simulator_screenshot_signal(int signal) {
+    UNUSED(signal);
+    simulator_screenshot_signalled = 1;
+}
+
+/** Let SIGUSR2 ask for a screenshot, so a script driving the HTTP API can take
+ * one without the window being touched.
+ *
+ * A handler rather than a sigwait thread: the port unblocks every signal on a
+ * task's thread the first time it runs (see prvSetupSignalsAndSchedulerPolicy),
+ * so a signal aimed at the process lands on whichever task is running and a
+ * thread waiting for it never sees it — SIGUSR2 would just kill the simulator.
+ * All the handler does is set a flag, which is safe wherever it runs.
+ *
+ * SIGUSR2 because the port has already taken SIGUSR1 to resume tasks.
+ */
+static void simulator_install_screenshot_signal(void) {
+    struct sigaction action = {
+        .sa_handler = simulator_screenshot_signal,
+        /* Tasks spend their time in syscalls; do not hand them an EINTR. */
+        .sa_flags = SA_RESTART,
+    };
+    sigemptyset(&action.sa_mask);
+
+    if(sigaction(SIGUSR2, &action, NULL) != 0) {
+        fprintf(stderr, "[sim] no SIGUSR2 screenshot trigger: %s\n", strerror(errno));
+    }
+}
+
+/** Serve screenshot requests for as long as the simulator is up.
+ *
+ * F12 and SIGUSR2 both only raise a flag: the encoder allocates from furi's
+ * heap, so the capture itself has to happen in a task. Captures are numbered
+ * from one so a session's worth of them accumulates rather than overwrites,
+ * which is what driving the simulator over the HTTP API wants.
+ */
+static int32_t simulator_screenshot_thread(void* context) {
+    UNUSED(context);
+
+    unsigned sequence = 0;
+
+    while(true) {
+        bool requested = sim_window_take_screenshot_request();
+
+        if(simulator_screenshot_signalled) {
+            simulator_screenshot_signalled = 0;
+            requested = true;
+        }
+
+        if(requested) sim_window_screenshot(simulator_screenshot_dir(), ++sequence);
+
+        furi_delay_ms(50);
+    }
 
     return 0;
 }
@@ -272,6 +337,10 @@ static void* simulator_scheduler_thread(void* arg) {
         if(config.scene) scene_host_start(config.scene);
     }
 
+    FuriThread* screenshot =
+        furi_thread_alloc_ex("screenshot", 8 * 1024, simulator_screenshot_thread, NULL);
+    furi_thread_start(screenshot);
+
     if(config.exit_after_frames) {
         FuriThread* capture =
             furi_thread_alloc_ex("capture", 8 * 1024, simulator_capture_thread, NULL);
@@ -307,7 +376,8 @@ static void simulator_print_usage(const char* argv0) {
         "      --frames N    run N frames then exit\n"
         "      --keys LIST   replay buttons before exiting, e.g. \"down,ok\"\n"
         "      --list-apps   list every app that can be given to --scene\n"
-        "      --screenshot DIR  write front.png/back.png on exit (with --frames)\n"
+        "      --screenshot DIR  where captures go. Written on exit with --frames,\n"
+        "                    and any time F12 or SIGUSR2 arrives (default: .)\n"
         "      --api-port N  serve the device HTTP API on N (default 8042, 0 disables)\n"
         "      --no-mdns     do not announce the simulator on the local network\n"
         "  -h, --help        this message\n"
@@ -385,6 +455,8 @@ int main(int argc, char** argv) {
     }
 
     sim_window_request_selftest();
+
+    simulator_install_screenshot_signal();
 
     pthread_t scheduler;
     if(pthread_create(&scheduler, NULL, simulator_scheduler_thread, NULL) != 0) {

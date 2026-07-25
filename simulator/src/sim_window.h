@@ -43,11 +43,22 @@ void sim_window_inject_key(uint8_t key, bool pressed);
 /** Run the control hit-test check on the next frame. */
 void sim_window_request_selftest(void);
 
+/** Ask for a screenshot. Safe from any thread, including a signal handler's
+ * companion, since the capture itself has to happen in a task. */
+void sim_window_request_screenshot(void);
+
+/** Consume a pending screenshot request. Call from a task. */
+bool sim_window_take_screenshot_request(void);
+
 /** Ask the main loop to stop; safe to call from a FreeRTOS task. */
 void sim_window_request_quit(void);
 
-/** Write both displays to front.png/back.png in @p directory.
+/** Write both displays and the whole window into @p directory.
+ *
+ * @p sequence 0 writes front.png, back.png and window.png; anything else
+ * appends it, so repeated captures of a running simulator do not overwrite
+ * each other.
  *
  * Encodes through lodepng, which allocates from furi's heap, so this must be
  * called from a FreeRTOS task rather than the SDL thread. */
-void sim_window_screenshot(const char* directory);
+void sim_window_screenshot(const char* directory, unsigned sequence);

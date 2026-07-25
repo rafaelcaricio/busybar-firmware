@@ -36,6 +36,13 @@ cmake --build simulator/build
 ./simulator/build/busybar-sim --scene clock
 ```
 
+Reconfigure rather than rebuild after changing anything under `assets/` or an
+app's `resources/`: the asset tree is generated at configure time.
+
+To check a change by looking at it instead of by hand, see
+[Walking the UI](#walking-the-ui-toolssimctlpy) — `tools/simctl.py` starts a
+simulator, presses buttons and captures the panels.
+
 The submodules the simulator needs are `lib/lvgl`, `lib/cjson`, `lib/mongoose`,
 `lib/nanopb`, `assets/proto`, `lib/stb/stb_repo`, `fbt_layers/core_libs` and
 `fbt_layers/freertos` (the last two recursively). CMake names the missing one
@@ -49,7 +56,7 @@ Options:
 | `-s, --scale N` | pixels per front LED; the default fills the screen, and the window is resizable |
 | `--frames N` | run N frames then exit |
 | `--keys LIST` | replay buttons before exiting, e.g. `up,ok` |
-| `--screenshot DIR` | write `front.png`, `back.png` and `window.png` on exit |
+| `--screenshot DIR` | where captures go: on exit with `--frames`, and whenever F12 or SIGUSR2 arrives |
 | `--list-apps` | print every app that can be given to `--scene` |
 | `--api-port N` | serve the device HTTP API on N, default 8042; `0` disables |
 | `--no-mdns` | do not announce the simulator on the local network |
@@ -65,6 +72,14 @@ from somewhere other than the selector.
 builds under `build/assets_root`, which mirrors the device layout so
 `/ext/apps_assets/shared/fonts/...` and `/ext/apps_assets/clock/images/...`
 both resolve.
+
+The tree carries two kinds of file. Most are build products — fonts, `.image`,
+`.anim`, `.snd` — converted from `assets/` by `tools/gen_runtime_assets.py`.
+The rest ship as they are, and live in an app's own `resources` directory,
+which mirrors `/ext` below itself: the Busy app's themes are
+`applications/main/busy/resources/apps_assets/busy/themes/<name>/theme.json`,
+and each `theme.json` points at a background animation the converters produce.
+Both halves have to be there or the theme picker offers only `BUSY`.
 
 ## Controls
 
@@ -158,6 +173,58 @@ To run any of these headlessly and look at the result:
 no LED rendering, so they are the right thing to inspect a layout in.
 `window.png` is the whole window, which is the only one that shows the
 presentation itself.
+
+### Walking the UI: `tools/simctl.py`
+
+`--frames` is not required. A simulator that is up takes a screenshot when it
+receives **F12** or **SIGUSR2**, into `--screenshot`'s directory or the working
+directory, and the firmware's own HTTP API takes button presses. Together that
+is enough to walk the interface from a shell, which beats guessing at a
+`--keys` string and re-running from boot each time.
+
+`tools/simctl.py` drives it. Nothing but the standard library, so it runs
+wherever the simulator builds:
+
+```sh
+simulator/tools/simctl.py start --scene busy --shots /tmp/shots
+simulator/tools/simctl.py run next ok shot:setup next ok shot:theme
+simulator/tools/simctl.py log --lines 40
+simulator/tools/simctl.py stop
+```
+
+| command | |
+| --- | --- |
+| `start [--scene NAME] [--shots DIR] [--port N]` | launch, and wait for the API to answer |
+| `press KEY...` | one or more buttons |
+| `shot [LABEL]` | capture, wait for it to land, print the paths |
+| `run STEP...` | keys, `shot`, `shot:label` and `wait:N` in sequence |
+| `status` | the session, plus the device's own `/api/status` |
+| `log [--lines N]` | tail the simulator's output |
+| `stop` | end the session |
+
+The session — pid, port, capture directory — lives in `build/`, so everything
+after `start` takes no arguments. Captures are numbered `window-001.png` and so
+on; a label renames them to `<label>-window.png` instead.
+
+Three things it exists to get right:
+
+- **Key names.** `/api/input` speaks the *device's* names, where `up` is a
+  direction of dial rotation and moves the highlight *down* — the same
+  inversion described under Controls above. `simctl.py` passes `up` and `down`
+  through untouched, and also accepts `next` and `prev`, which say what happens
+  on screen.
+- **Waiting for a capture.** An encode is a couple of seconds, nearly all of it
+  the window. `shot` waits for the simulator's own "wrote" line rather than
+  sleeping, so a capture is never read half-written.
+- **Waiting for startup.** `start` polls `/api/status` instead of guessing how
+  long boot takes.
+
+Both triggers only raise a flag; the encoding happens in a task, because
+lodepng allocates from furi's heap. SIGUSR2 rather than SIGUSR1 because the
+FreeRTOS port resumes tasks with that one.
+
+There is a skill for this at `.claude/skills/busybar-simulator/`, which is the
+same workflow written for an agent.
 
 ## What the apps are talking to
 
