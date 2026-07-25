@@ -16,8 +16,14 @@
 extern "C" {
 #endif
 
-/** Size of the static buffer furi's allocator manages in the simulator. */
-#define FURI_HAL_MEMORY_HEAP_SIZE (32 * 1024 * 1024)
+/** Size of the static buffer furi's allocator manages in the simulator.
+ *
+ * Far larger than the device's, because two host-only jobs allocate from it:
+ * LVGL's lodepng, which encodes a screenshot of the whole window and so scales
+ * with the display the simulator is running on, and the state publisher's
+ * frame buffers. The pages are untouched until something asks for them.
+ */
+#define FURI_HAL_MEMORY_HEAP_SIZE (192 * 1024 * 1024)
 
 typedef enum {
     FuriHalMemoryRegionIdHeap,

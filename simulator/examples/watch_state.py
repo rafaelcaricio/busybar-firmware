@@ -21,7 +21,14 @@ import asyncio
 import sys
 
 from busylib import AsyncBusyBar
-from busylib.devices import BusyBarDevices
+
+try:
+    from busylib.devices import BusyBarDevices
+except ImportError:
+    # Discovery is not in every busylib: the published wheel has no
+    # busylib.devices, so run this against a checkout that does, or let it
+    # fall through to localhost below.
+    BusyBarDevices = None
 
 API_PORT = 8042
 
@@ -31,6 +38,10 @@ NOISY = {"frame"}
 
 def find_device() -> str:
     """Return an address to connect to, preferring a discovered device."""
+    if BusyBarDevices is None:
+        print("this busylib cannot discover; using localhost")
+        return f"127.0.0.1:{API_PORT}"
+
     for device in BusyBarDevices.discover():
         for address in sorted(device.addresses, key=lambda a: a.ip_address):
             print(f"found {device.name!r} at {address.ip_address}")

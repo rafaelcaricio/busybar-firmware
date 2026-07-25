@@ -1,6 +1,7 @@
 #include "sim_window.h"
 #include "input_host.h"
 #include "sim_controls.h"
+#include "sim_led_panel.h"
 
 #include <front_display/front_display.h>
 #include <back_display/back_display.h>
@@ -21,6 +22,12 @@
 #define BEZEL          (4)
 #define KEY_QUEUE_SIZE (64)
 
+/* Magnification to open at when none is asked for. The panels are 72x16 and
+ * 160x80: at anything less than this the LEDs are too small to read and the
+ * window is a postage stamp on a desktop display. Trimmed at startup if the
+ * screen cannot take it. */
+#define SIM_WINDOW_DEFAULT_SCALE (10)
+
 typedef struct {
     uint8_t key;
     bool pressed;
@@ -31,6 +38,9 @@ static struct {
     SDL_Renderer* renderer;
     SDL_Texture* front_texture;
     SDL_Texture* back_texture;
+    /* The front panel is an LED matrix and is drawn as one; the back panel is
+     * a greyscale display and is drawn as it is. */
+    SimLedPanel* front_leds;
     /* Separate factors: the front bar is magnified harder than the back panel. */
     int front_scale;
     int back_scale;
@@ -75,10 +85,12 @@ static uint8_t sim_window_map_key(SDL_Keycode code) {
         return SIM_KEY_SCROLL_UP;
     case SDLK_DOWN:
         return SIM_KEY_SCROLL_DOWN;
+    /* The device has no left or right button — see input_host_key_exists() —
+     * so these are the dial too. Pickers that draw < > chevrons invite them. */
     case SDLK_LEFT:
-        return InputKeyLeft;
+        return SIM_KEY_SCROLL_UP;
     case SDLK_RIGHT:
-        return InputKeyRight;
+        return SIM_KEY_SCROLL_DOWN;
     case SDLK_RETURN:
         return InputKeyOk;
     /* The wide pad on top of the device. */
@@ -121,8 +133,14 @@ static void sim_window_push_key(uint8_t key, bool pressed) {
     sim.key_head = next;
 }
 
+/** How tall the window has to be to give both panels @p scale. */
+static int sim_window_height_for(int scale, int width) {
+    return (BACK_DISPLAY_H + FRONT_DISPLAY_H) * scale + 3 * MARGIN + 2 * BEZEL + GAP +
+           sim_controls_preferred_height(width) + MARGIN;
+}
+
 bool sim_window_init(int scale) {
-    const int initial = scale > 0 ? scale : 6;
+    int initial = scale > 0 ? scale : SIM_WINDOW_DEFAULT_SCALE;
     sim.front_scale = initial;
     sim.back_scale = initial;
     pthread_mutex_init(&sim.lock, NULL);
@@ -137,9 +155,23 @@ bool sim_window_init(int scale) {
     }
 
     /* Open at the requested scale, but the layout is recomputed from the
-     * actual canvas every frame, so the window can be resized freely. */
-    const int width = BACK_DISPLAY_W * initial + 2 * MARGIN;
-    const int height = (BACK_DISPLAY_H + FRONT_DISPLAY_H) * initial + 3 * MARGIN + 2 * BEZEL;
+     * actual canvas every frame, so the window can be resized freely.
+     *
+     * The height has to carry the control deck as well as the two panels, or
+     * the layout shrinks them to fit and the window opens smaller than asked.
+     */
+    int width = BACK_DISPLAY_W * initial + 2 * MARGIN;
+    int height = sim_window_height_for(initial, width);
+
+    /* Shrink to fit rather than opening off the bottom of the screen. */
+    SDL_Rect usable;
+    if(SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+        while(initial > 1 && (width > usable.w || height > usable.h)) {
+            initial--;
+            width = BACK_DISPLAY_W * initial + 2 * MARGIN;
+            height = sim_window_height_for(initial, width);
+        }
+    }
 
     sim.window = SDL_CreateWindow(
         "BUSY Bar simulator",
@@ -183,10 +215,17 @@ bool sim_window_init(int scale) {
     SDL_SetTextureScaleMode(sim.front_texture, SDL_ScaleModeNearest);
     SDL_SetTextureScaleMode(sim.back_texture, SDL_ScaleModeNearest);
 
+    sim.front_leds = sim_led_panel_alloc(sim.renderer, FRONT_DISPLAY_W, FRONT_DISPLAY_H);
+    if(!sim.front_leds) {
+        fprintf(stderr, "sim_led_panel_alloc failed\n");
+        return false;
+    }
+
     return true;
 }
 
 void sim_window_deinit(void) {
+    sim_led_panel_free(sim.front_leds);
     if(sim.front_texture) SDL_DestroyTexture(sim.front_texture);
     if(sim.back_texture) SDL_DestroyTexture(sim.back_texture);
     if(sim.renderer) SDL_DestroyRenderer(sim.renderer);
@@ -439,10 +478,11 @@ bool sim_window_pump(void) {
     SDL_SetRenderDrawColor(sim.renderer, 18, 18, 22, 255);
     SDL_RenderClear(sim.renderer);
 
-    sim_window_draw_bezel(&front_rect);
+    /* Only the back panel gets a drawn bezel: the front one brings its own,
+     * the rounded window the LEDs sit behind. */
     sim_window_draw_bezel(&back_rect);
 
-    SDL_RenderCopy(sim.renderer, sim.front_texture, NULL, &front_rect);
+    sim_led_panel_render(sim.front_leds, sim.front_texture, &front_rect);
     SDL_RenderCopy(sim.renderer, sim.back_texture, NULL, &back_rect);
 
     pthread_mutex_lock(&sim.lock);

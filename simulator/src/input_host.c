@@ -23,6 +23,8 @@
 
 #include <input/input.h>
 
+#define TAG "InputHost"
+
 #define INPUT_PRESS_TICKS       (150)
 #define INPUT_LONG_PRESS_COUNTS (2)
 
@@ -61,6 +63,23 @@ static Input input_instance;
 /* Mirrors the state above for the SDL thread, which draws the selected lever
  * position and must not take furi's locks. */
 static _Atomic InputKey input_switch_key = InputKeyMAX;
+
+/* The enum carries Left and Right, but the device has no such buttons: it
+ * scrolls with the dial, and the firmware's own key tables agree -- the ten in
+ * api_input.c and the ten the state publisher translates both stop at the dial,
+ * Ok, Back, Start and the five selector positions. A subscriber that meets a
+ * key the hardware cannot produce is entitled to treat it as impossible, and
+ * the state publisher does: it asserts. So the simulator refuses to invent
+ * buttons rather than expecting every subscriber to tolerate them. */
+static bool input_host_key_exists(InputKey key) {
+    switch(key) {
+    case InputKeyLeft:
+    case InputKeyRight:
+        return false;
+    default:
+        return key < InputKeyMAX;
+    }
+}
 
 static void input_host_publish(InputKey key, InputType type, uint32_t sequence) {
     const InputEvent event = {
@@ -102,6 +121,12 @@ static int32_t input_host_srv(void* context) {
 
         while(sim_window_poll_key(&raw_key, &pressed)) {
             const InputKey key = (InputKey)raw_key;
+
+            if(!input_host_key_exists(key)) {
+                FURI_LOG_W(TAG, "no button %u on the device, ignoring", (unsigned)key);
+                continue;
+            }
+
             InputKeyState* state = &states[key];
 
             if(pressed && key >= INPUT_SWITCH_RANGE_START && key <= INPUT_SWITCH_RANGE_END) {
@@ -123,10 +148,12 @@ static int32_t input_host_srv(void* context) {
                 const bool was_long = state->long_sent;
                 state->pressed = false;
 
-                input_host_publish(key, InputTypeRelease, sequences[key]);
+                /* Short comes first, as it does on the device: the release
+                 * handler there publishes it before the release itself. */
                 if(!was_long) {
                     input_host_publish(key, InputTypeShort, sequences[key]);
                 }
+                input_host_publish(key, InputTypeRelease, sequences[key]);
             }
         }
 

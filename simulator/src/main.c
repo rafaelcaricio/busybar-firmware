@@ -75,7 +75,8 @@ static struct {
     int api_port;
     bool announce;
 } config = {
-    .scale = 6,
+    /* 0 means "as large as the screen allows"; see sim_window_init(). */
+    .scale = 0,
     /* No scene by default: the mode selector decides what runs, as on the
      * device. --scene overrides the boot app without pinning it. */
     .scene = NULL,
@@ -94,7 +95,6 @@ static const struct {
 } simulator_key_names[] = {
     /* Screen-relative, like the arrow keys; see SIM_KEY_SCROLL_UP. */
     {"up", SIM_KEY_SCROLL_UP},  {"down", SIM_KEY_SCROLL_DOWN},
-    {"left", InputKeyLeft},     {"right", InputKeyRight},
     {"ok", InputKeyOk},         {"back", InputKeyBack},
     {"start", InputKeyStart},   {"busy", InputKeyBusy},
     {"custom", InputKeyCustom}, {"off", InputKeyOff},
@@ -301,7 +301,7 @@ static void simulator_print_usage(const char* argv0) {
     printf(
         "Usage: %s [options]\n"
         "\n"
-        "  -s, --scale N     pixel magnification (default 6)\n"
+        "  -s, --scale N     pixel magnification (default: fills the screen)\n"
         "      --scene NAME  app to boot into, or \"demo\" for the widget demo.\n"
         "                    By default the mode selector decides, as on the device.\n"
         "      --frames N    run N frames then exit\n"
@@ -315,7 +315,7 @@ static void simulator_print_usage(const char* argv0) {
         "Environment:\n"
         "  BUSYBAR_SIM_ASSETS  directory served as LVGL drive 'C'\n"
         "\n"
-        "Keys: arrows, Enter/Space = Ok, Esc = Back, s = Start\n"
+        "Keys: arrows = dial, Enter/Space = Ok, Esc = Back, s = Start\n"
         "Mode selector: b = Busy, c = Custom, o = Off, a = Apps, ',' = Settings\n",
         argv0);
 }

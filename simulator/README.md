@@ -46,7 +46,7 @@ Options:
 | Flag | Meaning |
 | --- | --- |
 | `--scene NAME` | app to boot into, or `demo` for the widget demo; by default the mode selector decides |
-| `-s, --scale N` | initial window scale, default 6; the window is resizable |
+| `-s, --scale N` | initial window scale; the default fills the screen, and the window is resizable |
 | `--frames N` | run N frames then exit |
 | `--keys LIST` | replay buttons before exiting, e.g. `up,ok` |
 | `--screenshot DIR` | write `front.png`, `back.png` and `window.png` on exit |
@@ -111,6 +111,15 @@ that is the device's own contract, and a script written against the simulator
 should send what it would send to a Busy Bar. `SIM_KEY_SCROLL_UP` in
 `src/input_host.h` is the single place this is inverted.
 
+Left and right are the dial as well: `Left` scrolls like `Up` and `Right` like
+`Down`. `InputKey` does have `InputKeyLeft` and `InputKeyRight`, but no button
+produces them — the dial is the device's only directional input, and the
+firmware's own key tables list ten keys without them: the dial, `Ok`, `Back`,
+`Start` and the five selector positions. Sending one is not a harmless no-op;
+subscribers treat those keys as impossible, and the state publisher asserts on
+them outright. `input_host_key_exists()` drops keys the hardware cannot produce
+so a stray one cannot take the simulator down.
+
 ## Applications
 
 Every GUI application in the tree runs, plus a hand-built `demo` scene for
@@ -145,8 +154,10 @@ To run any of these headlessly and look at the result:
     --screenshot /tmp/shots
 ```
 
-`front.png` and `back.png` are the panels magnified; `window.png` is the whole
-window, which is the only one that shows the layout itself.
+`front.png` and `back.png` are the framebuffers magnified pixel for pixel —
+no LED rendering, so they are the right thing to inspect a layout in.
+`window.png` is the whole window, which is the only one that shows the
+presentation itself.
 
 ## What the apps are talking to
 
@@ -287,6 +298,11 @@ for device in BusyBarDevices.discover():
     print(device.name, device.addresses)     # BUSY Simulator {...}
 ```
 
+`busylib.devices` is not in the published wheel — discovery needs a busylib
+checkout that has it, and the `zeroconf` dependency that comes with it.
+`examples/watch_state.py` falls back to localhost when the installed busylib
+cannot browse.
+
 Two services are registered, and only one of them is the firmware's:
 
 - `_http._tcp` — what `web_server` asks for through `discovery_service_add()`,
@@ -327,6 +343,31 @@ magnification to be readable. Both scales stay integers, because a fractional
 one makes some source pixels a row wider than their neighbours — distortion in
 exactly the layouts this tool exists to check. Resizing the window recomputes
 both.
+
+Without `--scale` the window opens as large as the screen allows, which is
+usually a magnification of around 7–10. The panels are 72x16 and 160x80; at
+anything less the LEDs are too small to read.
+
+### The front panel is drawn as LEDs
+
+The front display is not a screen. It is a grid of discrete LEDs behind a dark
+window, so an unlit panel still shows its dots and a lit one hazes into the
+gaps between them. Magnifying the framebuffer gives flat blocks instead, which
+reads as a brighter and much flatter display than the device has.
+
+`src/sim_led_panel.c` draws it the way the hardware looks, in four passes: the
+dark window the matrix sits behind, every LED in the colour an unlit one
+reflects, the framebuffer carved into rounded squares by a mask, and the
+framebuffer again — smoothly magnified and added on top twice — for the haze
+around lit pixels.
+
+The mask is one texture covering the panel rather than a draw per LED, so the
+whole effect is a handful of draw calls a frame and is rebuilt only when the
+window is resized. Below four pixels per LED there is no room for a dot and the
+cells are filled solid instead.
+
+The back panel is a greyscale display rather than a matrix — the firmware sets
+its contrast, not its brightness — so it is drawn as it is.
 
 ## How it fits together
 
@@ -408,7 +449,7 @@ Measured after the fix: 36 runs of 300–400 frames across all four scenes, idle
 and under a saturated CPU, with no hang and no assert; simulated time tracks
 wall time at 1.00.
 
-The allocator is furi's own `memmgr_heap.c` running over a static 32 MB region
+The allocator is furi's own `memmgr_heap.c` running over a static 192 MB region
 handed to it by `shim/furi_hal_host.c`, not a FreeRTOS `heap_N.c`. furi
 overrides `malloc`, so heap_3 — which forwards to `malloc` — recurses until the
 stack dies.
