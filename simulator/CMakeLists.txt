@@ -223,6 +223,29 @@ endif()
 message(STATUS "Runtime ${RUNTIME_ASSETS_OUTPUT}")
 
 # ---------------------------------------------------------------------------
+# Device renders
+#
+# The window draws the two virtual displays onto renders of the device. They
+# are stripped to raw frames here so src/sim_background.c can read them without
+# a PNG decoder — see tools/gen_panel_backgrounds.py for why that matters.
+# ---------------------------------------------------------------------------
+set(BACKGROUNDS_GEN_DIR ${CMAKE_BINARY_DIR}/backgrounds)
+
+execute_process(
+    COMMAND ${UV_EXECUTABLE} run --quiet
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_panel_backgrounds.py
+            --assets ${CMAKE_CURRENT_SOURCE_DIR}/assets
+            --out ${BACKGROUNDS_GEN_DIR}
+    RESULT_VARIABLE BACKGROUNDS_RESULT
+    OUTPUT_VARIABLE BACKGROUNDS_OUTPUT
+    ERROR_VARIABLE BACKGROUNDS_OUTPUT
+)
+if(NOT BACKGROUNDS_RESULT EQUAL 0)
+    message(FATAL_ERROR "background generation failed:\n${BACKGROUNDS_OUTPUT}")
+endif()
+message(STATUS "Device ${BACKGROUNDS_OUTPUT}")
+
+# ---------------------------------------------------------------------------
 # Firmware UI layer
 # ---------------------------------------------------------------------------
 file(GLOB GUI_SOURCES
@@ -617,6 +640,7 @@ target_include_directories(busybar-sim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim/platform
     ${REPO_ROOT}/applications/main
     ${ASSETS_GEN_DIR}
+    ${BACKGROUNDS_GEN_DIR}
     ${SDL2_INCLUDE_DIRS}
 )
 

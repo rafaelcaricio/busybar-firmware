@@ -1,5 +1,6 @@
 #include "sim_window.h"
 #include "input_host.h"
+#include "sim_background.h"
 #include "sim_controls.h"
 #include "sim_led_panel.h"
 
@@ -19,19 +20,27 @@
 
 #define MARGIN         (20)
 #define GAP            (28)
-#define BEZEL          (4)
 #define KEY_QUEUE_SIZE (64)
 
-/* Magnification to open at when none is asked for. The panels are 72x16 and
- * 160x80: at anything less than this the LEDs are too small to read and the
- * window is a postage stamp on a desktop display. Trimmed at startup if the
- * screen cannot take it. */
-#define SIM_WINDOW_DEFAULT_SCALE (10)
+/* Magnification to open at when none is asked for, in pixels per front LED.
+ * The matrix is only 72x16, so below about a dozen pixels an LED the panel
+ * stops being readable. Trimmed at startup if the screen cannot take it. */
+#define SIM_WINDOW_DEFAULT_SCALE (18)
 
 typedef struct {
     uint8_t key;
     bool pressed;
 } KeyEvent;
+
+/** The two device renders and the rectangles a frame is drawn into. */
+typedef struct {
+    SDL_Rect front_case;
+    SDL_Rect back_case;
+    SDL_Rect front_display;
+    SDL_Rect back_display;
+    SDL_Rect front_window;
+    SDL_Rect deck;
+} SimLayout;
 
 static struct {
     SDL_Window* window;
@@ -41,7 +50,11 @@ static struct {
     /* The front panel is an LED matrix and is drawn as one; the back panel is
      * a greyscale display and is drawn as it is. */
     SimLedPanel* front_leds;
-    /* Separate factors: the front bar is magnified harder than the back panel. */
+    /* The device itself, front above and back below, with the two displays
+     * landing where they sit on the hardware. */
+    SimBackground* front_background;
+    SimBackground* back_background;
+    /* Magnification each panel ended up at, for the screenshot writer. */
     int front_scale;
     int back_scale;
 
@@ -133,16 +146,68 @@ static void sim_window_push_key(uint8_t key, bool pressed) {
     sim.key_head = next;
 }
 
-/** How tall the window has to be to give both panels @p scale. */
-static int sim_window_height_for(int scale, int width) {
-    return (BACK_DISPLAY_H + FRONT_DISPLAY_H) * scale + 3 * MARGIN + 2 * BEZEL + GAP +
-           sim_controls_preferred_height(width) + MARGIN;
+/** Width the two cases are drawn at when the front matrix gets @p scale pixels
+ * per LED. Both are scaled by their display face, not their bounding box: see
+ * sim_background.h. */
+static int sim_window_face_width_for(int scale) {
+    return (int)((float)(scale * FRONT_DISPLAY_W) /
+                 sim_background_display_ratio(sim.front_background));
+}
+
+/** Widest the cases get at @p face_width, which is not the face width: the
+ * back render's side tabs stand a few percent proud of its panel. */
+static int sim_window_case_width_for(int face_width) {
+    const float front = sim_background_width_ratio(sim.front_background);
+    const float back = sim_background_width_ratio(sim.back_background);
+
+    return (int)((float)face_width * (front > back ? front : back) + 0.5f);
+}
+
+/** Height of the stacked cases at @p face_width, the gap between them included. */
+static int sim_window_stack_height_for(int face_width) {
+    const float ratio = sim_background_height_ratio(sim.front_background) +
+                        sim_background_height_ratio(sim.back_background);
+
+    return (int)((float)face_width * ratio + 0.5f) + GAP;
+}
+
+/** How tall the window has to be to draw the device at @p face_width. */
+static int sim_window_height_for(int face_width, int width) {
+    return sim_window_stack_height_for(face_width) + sim_controls_preferred_height(width) +
+           3 * MARGIN;
+}
+
+/** Size the window so the front matrix gets @p scale pixels per LED, or as
+ * close as the screen allows.
+ *
+ * The layout is recomputed from the actual canvas every frame, so this only
+ * decides where the window starts; it can be resized freely afterwards.
+ */
+static void sim_window_resize_to_fit(int scale) {
+    int face_width = sim_window_face_width_for(scale);
+    int width = sim_window_case_width_for(face_width) + 2 * MARGIN;
+    int height = sim_window_height_for(face_width, width);
+
+    /* Shrink to fit rather than opening off the bottom of the screen. */
+    SDL_Rect usable;
+    if(SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+        while(scale > 1 && (width > usable.w || height > usable.h)) {
+            scale--;
+            face_width = sim_window_face_width_for(scale);
+            width = sim_window_case_width_for(face_width) + 2 * MARGIN;
+            height = sim_window_height_for(face_width, width);
+        }
+    }
+
+    SDL_SetWindowSize(sim.window, width, height);
+    SDL_SetWindowPosition(sim.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 }
 
 bool sim_window_init(int scale) {
-    int initial = scale > 0 ? scale : SIM_WINDOW_DEFAULT_SCALE;
-    sim.front_scale = initial;
-    sim.back_scale = initial;
+    /* Replaced by the first layout pass; only matters if a screenshot beats
+     * it, and the writer cannot magnify by zero. */
+    sim.front_scale = 1;
+    sim.back_scale = 1;
     pthread_mutex_init(&sim.lock, NULL);
 
     /* Must be set before the renderer exists; per-texture scale modes are
@@ -154,32 +219,16 @@ bool sim_window_init(int scale) {
         return false;
     }
 
-    /* Open at the requested scale, but the layout is recomputed from the
-     * actual canvas every frame, so the window can be resized freely.
-     *
-     * The height has to carry the control deck as well as the two panels, or
-     * the layout shrinks them to fit and the window opens smaller than asked.
-     */
-    int width = BACK_DISPLAY_W * initial + 2 * MARGIN;
-    int height = sim_window_height_for(initial, width);
-
-    /* Shrink to fit rather than opening off the bottom of the screen. */
-    SDL_Rect usable;
-    if(SDL_GetDisplayUsableBounds(0, &usable) == 0) {
-        while(initial > 1 && (width > usable.w || height > usable.h)) {
-            initial--;
-            width = BACK_DISPLAY_W * initial + 2 * MARGIN;
-            height = sim_window_height_for(initial, width);
-        }
-    }
-
+    /* Opened hidden at a placeholder size: how big it wants to be depends on
+     * the device renders, and those need a renderer, which needs a window.
+     * sim_window_resize_to_fit() below settles it before anything is shown. */
     sim.window = SDL_CreateWindow(
         "BUSY Bar simulator",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
-        width,
-        height,
-        SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
+        960,
+        720,
+        SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
     if(!sim.window) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
@@ -221,10 +270,27 @@ bool sim_window_init(int scale) {
         return false;
     }
 
+    sim.front_background = sim_background_alloc(sim.renderer, SimBackgroundSideFront);
+    sim.back_background = sim_background_alloc(sim.renderer, SimBackgroundSideBack);
+    if(!sim.front_background || !sim.back_background) {
+        fprintf(stderr, "[sim] device renders are missing; re-run cmake to regenerate them\n");
+        return false;
+    }
+
+    /* The render brings its own window around the matrix, so the panel must
+     * not draw a second one. The spill rectangle is set per frame with the
+     * layout. */
+    sim_led_panel_set_glass(sim.front_leds, false, NULL);
+
+    sim_window_resize_to_fit(scale > 0 ? scale : SIM_WINDOW_DEFAULT_SCALE);
+    SDL_ShowWindow(sim.window);
+
     return true;
 }
 
 void sim_window_deinit(void) {
+    sim_background_free(sim.front_background);
+    sim_background_free(sim.back_background);
     sim_led_panel_free(sim.front_leds);
     if(sim.front_texture) SDL_DestroyTexture(sim.front_texture);
     if(sim.back_texture) SDL_DestroyTexture(sim.back_texture);
@@ -308,19 +374,16 @@ static void sim_window_upload(void) {
     }
 }
 
-/** Place both panels in the current canvas.
+/** Place the device in the current canvas: front above, back below.
  *
- * The front LED bar is the device's headline display, so it gets the full
- * width and the back panel takes what is left underneath. That means two
- * different scale factors rather than one shared one — their on-screen sizes
- * no longer reflect their physical sizes, which is the point: the front panel
- * is only 16 rows tall and needs the magnification to be readable.
- *
- * Both scales stay integers. A fractional one makes some source pixels a row
- * wider than their neighbours, which reads as distortion in exactly the
- * layouts this tool exists to check.
+ * Both cases are drawn at one display-face width, so the device is the same
+ * size top and bottom, and each display is then placed by its render rather
+ * than by a scale factor of its own. The panels end up at whatever
+ * magnification that works out to — usually fractional, which is what the
+ * hardware looks like: neither panel's pixels are square multiples of the
+ * screen's.
  */
-static void sim_window_layout(SDL_Rect* front, SDL_Rect* back, SDL_Rect* deck) {
+static void sim_window_layout(SimLayout* layout) {
     int canvas_w = 0, canvas_h = 0;
     SDL_GetRendererOutputSize(sim.renderer, &canvas_w, &canvas_h);
 
@@ -331,72 +394,48 @@ static void sim_window_layout(SDL_Rect* front, SDL_Rect* back, SDL_Rect* deck) {
 
     const int deck_h = sim_controls_preferred_height(canvas_w);
 
-    *deck = (SDL_Rect){
+    layout->deck = (SDL_Rect){
         .x = MARGIN,
         .y = canvas_h - deck_h - MARGIN,
         .w = canvas_w - 2 * MARGIN,
         .h = deck_h,
     };
 
-    const int available_w = canvas_w - 2 * (BEZEL + MARGIN);
-    const int available_h =
-        canvas_h - deck_h - MARGIN - 2 * (BEZEL + MARGIN) - GAP - 2 * BEZEL;
+    const int available_w = canvas_w - 2 * MARGIN;
+    const int available_h = layout->deck.y - 2 * MARGIN;
 
-    int front_scale = available_w / FRONT_DISPLAY_W;
-    if(front_scale < 1) front_scale = 1;
+    /* The face width the canvas can carry, whichever constraint bites first. */
+    const float width_ratio_front = sim_background_width_ratio(sim.front_background);
+    const float width_ratio_back = sim_background_width_ratio(sim.back_background);
+    const float width_ratio =
+        width_ratio_front > width_ratio_back ? width_ratio_front : width_ratio_back;
+    const float height_ratio = sim_background_height_ratio(sim.front_background) +
+                               sim_background_height_ratio(sim.back_background);
 
-    /* Leave the back panel at least a third of the height to work with. */
-    int front_h = FRONT_DISPLAY_H * front_scale;
-    while(front_scale > 1 && front_h > (available_h * 2) / 3) {
-        front_scale--;
-        front_h = FRONT_DISPLAY_H * front_scale;
-    }
+    const int from_width = (int)((float)available_w / width_ratio);
+    const int from_height = (int)((float)(available_h - GAP) / height_ratio);
 
-    const int remaining_h = available_h - front_h;
-    int back_scale = available_w / BACK_DISPLAY_W;
-    if(remaining_h / BACK_DISPLAY_H < back_scale) back_scale = remaining_h / BACK_DISPLAY_H;
-    if(back_scale < 1) back_scale = 1;
+    int face_width = from_width < from_height ? from_width : from_height;
+    if(face_width < 1) face_width = 1;
 
-    sim.front_scale = front_scale;
-    sim.back_scale = back_scale;
+    const int centre_x = canvas_w / 2;
+    layout->front_case = sim_background_case_rect(sim.front_background, face_width, centre_x, 0);
+    layout->back_case = sim_background_case_rect(sim.back_background, face_width, centre_x, 0);
 
-    const int front_w = FRONT_DISPLAY_W * front_scale;
-    const int back_w = BACK_DISPLAY_W * back_scale;
-    const int back_h = BACK_DISPLAY_H * back_scale;
+    const int block_h = layout->front_case.h + GAP + layout->back_case.h;
+    layout->front_case.y = MARGIN + (available_h - block_h) / 2;
+    layout->back_case.y = layout->front_case.y + layout->front_case.h + GAP;
 
-    const int block_h = front_h + back_h + GAP + 2 * BEZEL;
-    const int panel_area_h = canvas_h - deck_h - MARGIN;
-    const int top = (panel_area_h - block_h) / 2 + BEZEL;
+    layout->front_display =
+        sim_background_display_rect(sim.front_background, &layout->front_case);
+    layout->back_display = sim_background_display_rect(sim.back_background, &layout->back_case);
+    layout->front_window = sim_background_window_rect(sim.front_background, &layout->front_case);
 
-    *front = (SDL_Rect){
-        .x = (canvas_w - front_w) / 2,
-        .y = top,
-        .w = front_w,
-        .h = front_h,
-    };
-    *back = (SDL_Rect){
-        .x = (canvas_w - back_w) / 2,
-        .y = top + front_h + GAP + 2 * BEZEL,
-        .w = back_w,
-        .h = back_h,
-    };
-}
-
-/** A thin surround so each panel reads as a separate physical display. */
-static void sim_window_draw_bezel(const SDL_Rect* panel) {
-    for(int inset = 1; inset <= BEZEL; inset++) {
-        /* Fade the frame outwards, brightest against the panel edge. */
-        const uint8_t level = (uint8_t)(72 - (inset - 1) * (48 / BEZEL));
-        SDL_SetRenderDrawColor(sim.renderer, level, level, level + 6, 255);
-
-        const SDL_Rect edge = {
-            .x = panel->x - inset,
-            .y = panel->y - inset,
-            .w = panel->w + 2 * inset,
-            .h = panel->h + 2 * inset,
-        };
-        SDL_RenderDrawRect(sim.renderer, &edge);
-    }
+    /* Only the screenshot writer reads these, and it needs whole pixels. */
+    sim.front_scale = layout->front_display.w / FRONT_DISPLAY_W;
+    sim.back_scale = layout->back_display.w / BACK_DISPLAY_W;
+    if(sim.front_scale < 1) sim.front_scale = 1;
+    if(sim.back_scale < 1) sim.back_scale = 1;
 }
 
 bool sim_window_pump(void) {
@@ -466,24 +505,25 @@ bool sim_window_pump(void) {
 
     sim_window_upload();
 
-    SDL_Rect front_rect, back_rect, deck_rect;
-    sim_window_layout(&front_rect, &back_rect, &deck_rect);
-    sim_controls_layout(&deck_rect);
+    SimLayout layout;
+    sim_window_layout(&layout);
+    sim_controls_layout(&layout.deck);
 
     if(sim.selftest_pending) {
         sim.selftest_pending = false;
         sim_controls_selftest();
     }
 
-    SDL_SetRenderDrawColor(sim.renderer, 18, 18, 22, 255);
+    /* The renders sit on black, so the window has to as well. */
+    SDL_SetRenderDrawColor(sim.renderer, 0, 0, 0, 255);
     SDL_RenderClear(sim.renderer);
 
-    /* Only the back panel gets a drawn bezel: the front one brings its own,
-     * the rounded window the LEDs sit behind. */
-    sim_window_draw_bezel(&back_rect);
+    sim_background_render(sim.front_background, &layout.front_case);
+    sim_background_render(sim.back_background, &layout.back_case);
 
-    sim_led_panel_render(sim.front_leds, sim.front_texture, &front_rect);
-    SDL_RenderCopy(sim.renderer, sim.back_texture, NULL, &back_rect);
+    sim_led_panel_set_glass(sim.front_leds, false, &layout.front_window);
+    sim_led_panel_render(sim.front_leds, sim.front_texture, &layout.front_display);
+    SDL_RenderCopy(sim.renderer, sim.back_texture, NULL, &layout.back_display);
 
     pthread_mutex_lock(&sim.lock);
     bool held[InputKeyMAX];

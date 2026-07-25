@@ -301,7 +301,7 @@ static void simulator_print_usage(const char* argv0) {
     printf(
         "Usage: %s [options]\n"
         "\n"
-        "  -s, --scale N     pixel magnification (default: fills the screen)\n"
+        "  -s, --scale N     pixels per front LED (default: fills the screen)\n"
         "      --scene NAME  app to boot into, or \"demo\" for the widget demo.\n"
         "                    By default the mode selector decides, as on the device.\n"
         "      --frames N    run N frames then exit\n"

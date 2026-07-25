@@ -46,7 +46,7 @@ Options:
 | Flag | Meaning |
 | --- | --- |
 | `--scene NAME` | app to boot into, or `demo` for the widget demo; by default the mode selector decides |
-| `-s, --scale N` | initial window scale; the default fills the screen, and the window is resizable |
+| `-s, --scale N` | pixels per front LED; the default fills the screen, and the window is resizable |
 | `--frames N` | run N frames then exit |
 | `--keys LIST` | replay buttons before exiting, e.g. `up,ok` |
 | `--screenshot DIR` | write `front.png`, `back.png` and `window.png` on exit |
@@ -336,17 +336,37 @@ without `.a` is fully transparent and nothing will appear.
 
 ## Window layout
 
-The front LED bar gets the full window width and the back panel takes what is
-left underneath, so their on-screen sizes deliberately do not reflect their
-physical sizes: the front panel is only 16 rows tall and needs the
-magnification to be readable. Both scales stay integers, because a fractional
-one makes some source pixels a row wider than their neighbours — distortion in
-exactly the layouts this tool exists to check. Resizing the window recomputes
-both.
+The window draws the device: `assets/front.png` above, `assets/back.png` below,
+with the two framebuffers landing where their displays sit on the hardware. So
+the panels are not scaled to fill the window — their size and position come out
+of the renders, and the magnification is whatever that works out to.
 
-Without `--scale` the window opens as large as the screen allows, which is
-usually a magnification of around 7–10. The panels are 72x16 and 160x80; at
-anything less the LEDs are too small to read.
+`src/sim_background.c` holds the geometry, four rectangles per side measured in
+that render's own pixels: the case, the black display face, the window the
+display shows through, and the display itself. The layout picks one face width
+for both sides — the renders differ by 3% in case width but the face is the
+same physical part — and everything else follows from it. Resizing the window
+recomputes the lot.
+
+The back display's rectangle was measured directly: its render bakes a status
+bar into the screen area, which the framebuffer then covers exactly. The front
+matrix is not drawn in its render, so its rectangle is derived from the window
+around it — a square LED pitch ties the horizontal inset to 4.5x the vertical
+one, and the window's corners decide how small both can get.
+
+`--scale` is pixels per front LED. Without it the window opens as large as the
+screen allows, usually around 12–18; below about a dozen the 72x16 matrix stops
+being readable.
+
+### Backgrounds are a build product
+
+The only PNG decoder linked in is LVGL's lodepng, which allocates through
+`lv_malloc`, and the window is built before the scheduler starts. So
+`tools/gen_panel_backgrounds.py` strips both renders to headerless RGB24 at
+configure time and the window reads them straight into a locked SDL texture.
+Replacing a render means replacing the PNG in `assets/` and re-measuring the
+rectangles in `sim_background.c`; a `static_assert` on the image dimensions
+fails the build if you change one without the other.
 
 ### The front panel is drawn as LEDs
 
@@ -355,11 +375,12 @@ window, so an unlit panel still shows its dots and a lit one hazes into the
 gaps between them. Magnifying the framebuffer gives flat blocks instead, which
 reads as a brighter and much flatter display than the device has.
 
-`src/sim_led_panel.c` draws it the way the hardware looks, in four passes: the
-dark window the matrix sits behind, every LED in the colour an unlit one
-reflects, the framebuffer carved into rounded squares by a mask, and the
-framebuffer again — smoothly magnified and added on top twice — for the haze
-around lit pixels.
+`src/sim_led_panel.c` draws it the way the hardware looks, in three passes:
+every LED in the colour an unlit one reflects, the framebuffer carved into
+rounded squares by a mask, and the framebuffer again — smoothly magnified and
+added on top twice — for the haze around lit pixels. It can draw the dark
+window the matrix sits behind as well, but the front render already has one, so
+that pass is off and the render's window bounds the haze instead.
 
 The mask is one texture covering the panel rather than a draw per LED, so the
 whole effect is a handful of draw calls a frame and is rebuilt only when the
@@ -418,7 +439,8 @@ Two more substitutions are by design rather than necessity: `lvgl_addons/fs` is
 replaced by `src/lv_fs_host.c` because the original routes LVGL file access
 through the storage service, and the assets are converted by
 `tools/gen_internal_assets.py` and `tools/gen_runtime_assets.py` rather than by
-fbt.
+fbt. `tools/gen_panel_backgrounds.py` is the simulator's own — the device has
+no use for a picture of itself.
 
 ### The tick
 

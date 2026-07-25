@@ -60,6 +60,10 @@ struct SimLedPanel {
     SDL_Rect glass_area;
     int width;
     int height;
+
+    bool draw_glass;
+    bool has_spill;
+    SDL_Rect spill;
 };
 
 /** Signed distance to a rounded rectangle centred on the origin. */
@@ -190,6 +194,7 @@ static bool sim_led_panel_resize(SimLedPanel* instance, int width, int height) {
     if(instance->mask) SDL_DestroyTexture(instance->mask);
     if(instance->lit) SDL_DestroyTexture(instance->lit);
     if(instance->glass) SDL_DestroyTexture(instance->glass);
+    instance->glass = NULL;
 
     instance->mask = sim_led_panel_build_mask(
         instance->renderer, width, height, instance->columns, instance->rows);
@@ -203,8 +208,6 @@ static bool sim_led_panel_resize(SimLedPanel* instance, int width, int height) {
     const float pitch = (float)width / (float)instance->columns;
     const int margin = (int)(pitch * GLASS_MARGIN_RATIO + 0.5f);
 
-    instance->glass = sim_led_panel_build_glass(
-        instance->renderer, width + 2 * margin, height + 2 * margin, pitch * GLASS_CORNER_RATIO);
     instance->glass_area = (SDL_Rect){
         .x = -margin,
         .y = -margin,
@@ -212,10 +215,18 @@ static bool sim_led_panel_resize(SimLedPanel* instance, int width, int height) {
         .h = height + 2 * margin,
     };
 
+    if(instance->draw_glass) {
+        instance->glass = sim_led_panel_build_glass(
+            instance->renderer,
+            instance->glass_area.w,
+            instance->glass_area.h,
+            pitch * GLASS_CORNER_RATIO);
+    }
+
     instance->width = width;
     instance->height = height;
 
-    return instance->mask && instance->lit && instance->glass;
+    return instance->mask && instance->lit && (instance->glass || !instance->draw_glass);
 }
 
 /** The panel grown by @p spread LED pitches on every side. */
@@ -237,8 +248,22 @@ SimLedPanel* sim_led_panel_alloc(SDL_Renderer* renderer, int columns, int rows) 
     instance->renderer = renderer;
     instance->columns = columns;
     instance->rows = rows;
+    instance->draw_glass = true;
 
     return instance;
+}
+
+void sim_led_panel_set_glass(SimLedPanel* instance, bool enabled, const SDL_Rect* spill) {
+    if(instance->draw_glass != enabled) {
+        /* The glass is built with the rest of the panel; drop it all so the
+         * next render rebuilds without it. */
+        if(instance->mask) SDL_DestroyTexture(instance->mask);
+        instance->mask = NULL;
+        instance->draw_glass = enabled;
+    }
+
+    instance->has_spill = spill != NULL;
+    if(spill) instance->spill = *spill;
 }
 
 void sim_led_panel_free(SimLedPanel* instance) {
@@ -258,13 +283,20 @@ void sim_led_panel_render(SimLedPanel* instance, SDL_Texture* frame, const SDL_R
         return;
     }
 
-    const SDL_Rect glass_area = {
+    /* Where the light is allowed to reach: the glass this panel draws, or the
+     * window the background render already has around the matrix. */
+    SDL_Rect glass_area = {
         .x = area->x + instance->glass_area.x,
         .y = area->y + instance->glass_area.y,
         .w = instance->glass_area.w,
         .h = instance->glass_area.h,
     };
-    SDL_RenderCopy(renderer, instance->glass, NULL, &glass_area);
+
+    if(instance->glass) {
+        SDL_RenderCopy(renderer, instance->glass, NULL, &glass_area);
+    } else if(instance->has_spill) {
+        glass_area = instance->spill;
+    }
 
     SDL_SetTextureBlendMode(instance->mask, SDL_BLENDMODE_BLEND);
     SDL_SetTextureColorMod(instance->mask, LED_OFF_R, LED_OFF_G, LED_OFF_B);
