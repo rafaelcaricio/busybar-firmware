@@ -275,8 +275,27 @@ if(NOT ANIM_PATCH_RESULT EQUAL 0)
     message(FATAL_ERROR "anim_file patching failed:\n${ANIM_PATCH_OUTPUT}")
 endif()
 
+# anim_file_seq.c compiles as it stands, but walks a looping single-frame
+# animation past the end of its file, which the busy timer's progress bar is.
+# The patched copy stops the log filling with "Load error" once a second.
+set(ANIM_FILE_SEQ_PATCHED ${CMAKE_BINARY_DIR}/anim_file_host/anim_file_seq.c)
+
+execute_process(
+    COMMAND ${UV_EXECUTABLE} run --quiet
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/patch_anim_file_seq.py
+            --input ${REPO_ROOT}/lib/anim_file/components/anim_file_seq.c
+            --output ${ANIM_FILE_SEQ_PATCHED}
+    RESULT_VARIABLE ANIM_SEQ_PATCH_RESULT
+    OUTPUT_VARIABLE ANIM_SEQ_PATCH_OUTPUT
+    ERROR_VARIABLE ANIM_SEQ_PATCH_OUTPUT
+)
+if(NOT ANIM_SEQ_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR "anim_file_seq patching failed:\n${ANIM_SEQ_PATCH_OUTPUT}")
+endif()
+
 file(GLOB ANIM_FILE_SOURCES ${REPO_ROOT}/lib/anim_file/components/*.c)
-list(APPEND ANIM_FILE_SOURCES ${ANIM_FILE_PATCHED})
+list(REMOVE_ITEM ANIM_FILE_SOURCES ${REPO_ROOT}/lib/anim_file/components/anim_file_seq.c)
+list(APPEND ANIM_FILE_SOURCES ${ANIM_FILE_PATCHED} ${ANIM_FILE_SEQ_PATCHED})
 
 # dsp.c convolves with hand-written Thumb-2 DSP instructions; the host build
 # uses a copy with that one helper expressed in portable C.

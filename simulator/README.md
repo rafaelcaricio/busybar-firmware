@@ -573,7 +573,7 @@ from furi's heap and so runs in a task, with a flag as the handshake.
 
 ## Sources that needed the host treatment
 
-Six files. Each is patched into the build directory at configure time — the
+Seven files. Each is patched into the build directory at configure time — the
 originals are never touched, and each patch fails loudly if the source drifts
 out from under it.
 
@@ -581,6 +581,7 @@ out from under it.
 | --- | --- | --- |
 | `furi/core/check.h` and `.c` | The crash message travels in `r12` via inline asm, expanded at every `furi_check()` call site, and the handler dumps Cortex-M registers and reads `CoreDebug->DHCSR`. | `shim/check_host.{h,c}`, copied over the staged tree |
 | `lib/anim_file/anim_file.c` | One GCC nested function, which clang has never supported. | `tools/patch_anim_file.py` |
+| `lib/anim_file/components/anim_file_seq.c` | Not portability — a firmware bug, see below. A looping single-frame animation reads past the end of its file once per tick. | `tools/patch_anim_file_seq.py` |
 | `lib/toolbox/dsp.c` | The convolution inner loop is Thumb-2 DSP assembly (`uxtb`, `smlabb`, `bfi`). | `tools/patch_dsp.py` |
 | `lvgl/src/libs/bin_decoder/lv_bin_decoder.c` | fbt rewrites it to claim the firmware's `.image` extension instead of `.bin`; unpatched, every icon fails to decode. | `tools/patch_bin_decoder.py` |
 | `FreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/port.c` | It compiles fine but deadlocks: the tick is a process-directed `SIGALRM`, so any thread can be handed it. See below. | `tools/patch_posix_port.py` |
@@ -592,6 +593,35 @@ through the storage service, and the assets are converted by
 `tools/gen_internal_assets.py` and `tools/gen_runtime_assets.py` rather than by
 fbt. `tools/gen_panel_backgrounds.py` is the simulator's own — the device has
 no use for a picture of itself.
+
+### The animation that runs off the end of its file
+
+`anim_file_seq.c` is the odd one in that table: it compiles on the host
+unchanged, and the patch fixes a bug the device has too.
+
+`anim_file_seq_load_current_frame()` advances to the next file frame even when
+`anim_file_start_last_frame()` has just re-seeded the sequence for a new loop,
+so the previous frame's size is added to an offset that was already reset to the
+start of the section. With several file frames the result still lands inside the
+file. With exactly one it lands on EOF, the header read comes back short, and
+the frame errors out.
+
+`busy/animations/progress_busy_41x16.anim` is exactly that — one frame at 1 fps,
+the fill behind the BUSY indicator — and `timer_indicator` plays it looping, so
+a running Busy session logged `[E][AnimFile] Load error` every second and buried
+everything else. The bar itself always drew correctly: the decoded frame stays
+in the canvas buffer, so the failed load changes nothing on screen.
+
+Hardware still does this. The patch is here so the log stays readable, not
+because the simulator is the thing at fault — delete it, and the CMake step that
+runs it, once `lib/anim_file` carries the fix.
+
+Two things make the error hard to read if you meet it fresh.
+`ANIM_FILE_DETAILED_ERRORS` in `lib/anim_file/anim_file_i.h` is commented out,
+so every one of the twenty-odd failure sites logs the same `Load error`; turn it
+on to find out which. And `AnimFile` never names the file — the path lives in
+`AnimPlayer`, so logging `instance->file_path` when a frame comes back with
+`AnimFileFrameFlagError` is what identifies the animation.
 
 ### The tick
 

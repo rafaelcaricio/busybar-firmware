@@ -97,6 +97,11 @@ the five lever positions `busy`, `custom`, `off`, `apps`, `settings`.
   screen is still mid-transition.
 - **A blank or stale panel is usually an asset, not a widget.** Check the log
   for `AnimFile` or asset errors first.
+- **`[E][AnimFile] Load error` names neither the reason nor the file.** Every
+  failure site logs that one string, and `AnimFile` never sees the path. Turn on
+  `ANIM_FILE_DETAILED_ERRORS` in `lib/anim_file/anim_file_i.h` for the reason,
+  and log `instance->file_path` from `anim_player_timer_cb` on
+  `AnimFileFrameFlagError` for the file. Revert both afterwards.
 - **Reconfigure after asset changes.** A plain `cmake --build` will not notice
   a new PNG, animation zip or `resources/` file.
 
