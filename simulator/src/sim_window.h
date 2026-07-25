@@ -53,6 +53,13 @@ bool sim_window_take_screenshot_request(void);
 /** Ask the main loop to stop; safe to call from a FreeRTOS task. */
 void sim_window_request_quit(void);
 
+/** Size of the render target a whole-window capture comes back at.
+ *
+ * Not the window size: on a HiDPI display the renderer is larger than the
+ * window it is presented in, and a capture is in the renderer's pixels.
+ */
+void sim_window_canvas_size(int* width, int* height);
+
 /** Write both displays and the whole window into @p directory.
  *
  * @p sequence 0 writes front.png, back.png and window.png; anything else

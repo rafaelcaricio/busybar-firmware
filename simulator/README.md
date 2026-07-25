@@ -4,8 +4,8 @@ Runs the firmware's GUI stack and real applications on macOS/Linux against an
 SDL window, so a UI change can be looked at before it is flashed.
 
 <p align="center">
-  <img src="docs/window.jpg" width="680"
-       alt="The simulator running the Busy app: the front LED matrix showing the Lunch theme, the back panel counting down, and the control deck standing in for the device's top surface">
+  <img src="docs/demo.gif" width="680"
+       alt="The simulator being walked: a busy session starting on the Coding theme and counting down, the Clock app and its menu, the app list, the settings menu, and the mode selector returning to BUSY">
 </p>
 
 Both displays are drawn where they sit on the hardware, on renders of the
@@ -18,8 +18,10 @@ hardware does with the same framebuffer.
        alt="Five front panels stacked: the Meeting, On Call, Keep Out and Lunch themes, and the clock app">
 </p>
 
-Every image in this file is an unretouched capture, taken with
-`tools/simctl.py` (see [Walking the UI](#walking-the-ui-toolssimctlpy)).
+Every image in this file is an unretouched capture and the recording above an
+unretouched walkthrough, both taken with `tools/simctl.py` (see
+[Walking the UI](#walking-the-ui-toolssimctlpy) and
+[Recording](#recording-simctlpy-record)).
 
 What is real: LVGL and its software renderer, `lib/lvgl_addons` (themes and
 fonts), the whole of `applications/services/gui` (the `Widget` class and every
@@ -45,8 +47,9 @@ and "What the apps are talking to" below for which is which.
 
 ## Build and run
 
-Requires SDL2, CMake, Ninja and `uv`; ffmpeg is optional and only converts the
-sounds:
+Requires SDL2, CMake, Ninja and `uv`. ffmpeg is optional: the build uses it to
+convert the sounds, and [recording](#recording-simctlpy-record) to make the
+GIF; everything else works without it.
 
 ```sh
 cmake -S simulator -B simulator/build -G Ninja
@@ -78,6 +81,7 @@ Options:
 | `--list-apps` | print every app that can be given to `--scene` |
 | `--api-port N` | serve the device HTTP API on N, default 8042; `0` disables |
 | `--no-mdns` | do not announce the simulator on the local network |
+| `--control PATH` | serve the tools' control socket, which is what records the window |
 | `-v, --verbose` | furi logging at trace level |
 
 With no `--scene`, the simulator boots the way the device does: the startup app
@@ -190,7 +194,12 @@ To run any of these headlessly and look at the result:
 `front.png` and `back.png` are the framebuffers magnified pixel for pixel —
 no LED rendering, so they are the right thing to inspect a layout in.
 `window.png` is the whole window, which is the only one that shows the
-presentation itself.
+presentation itself:
+
+<p align="center">
+  <img src="docs/window.jpg" width="680"
+       alt="A window capture: the front LED matrix showing the Lunch theme, the back panel counting down, and the control deck standing in for the device's top surface">
+</p>
 
 ### Walking the UI: `tools/simctl.py`
 
@@ -216,6 +225,7 @@ simulator/tools/simctl.py stop
 | `press KEY...` | one or more buttons |
 | `shot [LABEL]` | capture, wait for it to land, print the paths |
 | `run STEP...` | keys, `shot`, `shot:label` and `wait:N` in sequence |
+| `record --out FILE.gif STEP...` | record the window while those steps play |
 | `status` | the session, plus the device's own `/api/status` |
 | `log [--lines N]` | tail the simulator's output |
 | `stop` | end the session |
@@ -243,6 +253,62 @@ FreeRTOS port resumes tasks with that one.
 
 There is a skill for this at `.claude/skills/busybar-simulator/`, which is the
 same workflow written for an agent.
+
+### Recording: `simctl.py record`
+
+Half of this interface is motion — the wipe between scenes, a label scrolling
+because it does not fit, the busy timer counting down — and a still says
+nothing about any of it. `record` runs the same steps `run` does with the
+window streaming to disk, and writes a GIF:
+
+```sh
+simulator/tools/simctl.py record --out demo.gif \
+    wait:1.2 start wait:3.5 apps wait:2.5 back wait:1.3 next wait:1.3
+```
+
+The steps are the same grammar, so `record --out idle.gif wait:15` is fifteen
+seconds of whatever is on screen and nothing else.
+
+| option | |
+| --- | --- |
+| `--out FILE.gif` | where the GIF goes |
+| `--fps N` | frames a second to aim for (default 12) |
+| `--divisor N` | shrink each frame by this whole factor as it is captured (default 3) |
+| `--width N` | scale to this width when encoding; native size by default |
+| `--keep-raw` | leave the raw frames in the capture directory |
+
+The recording at the top of this file is one of these, and `docs/demo.gif` in
+the tree; the walkthrough that made it is in `docs/demo.sh`.
+
+**How it works.** `src/sim_recorder.c` reads the finished frame back off the
+renderer on the SDL thread — the same read-back a screenshot uses — into
+buffers allocated when recording started, so nothing on that thread allocates
+and a frame the writer has no room for is dropped rather than stalling the
+loop. A task scales the frames down (averaged over the block, not sampled: the
+front panel is a grid of lit dots, and dropping pixels turns it into moire) and
+appends them to a raw RGB24 stream. `simctl.py` then hands that to **ffmpeg**,
+which is the one thing here that has to be on PATH.
+
+The palette is why ffmpeg does the encoding rather than the simulator: a fixed
+256-colour table either keeps the lit dots or keeps the case around them, and
+`palettegen` builds the table from the frames it is given — `stats_mode=diff`
+weighting it towards what moves, which is the panels.
+
+**What it costs.** A whole window is around four megapixels, and reading that
+back off the GPU is slower than the frame it is asked for: the loop that
+presents is also the loop that captures, so a recording generally lands under
+the `--fps` it was given. That is not a rounding error to ignore — a stream
+encoded at a rate it was not captured at plays back at the wrong speed — so the
+simulator times the frames it actually took and `record` encodes at that rate,
+printing the difference when there is one. The raw frames live in the capture
+directory and are deleted once the GIF is written; at the default divisor they
+run about 1.4 MB a frame.
+
+**Where the control channel is.** Recording is not part of the device's HTTP
+API, which is the firmware's own and knows nothing about windows. It goes over
+a unix socket the simulator serves when given `--control PATH`, which `start`
+passes; `src/sim_control.h` has the protocol, which is a line in and a line
+out.
 
 ## What the apps are talking to
 

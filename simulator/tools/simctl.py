@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""Drive a running simulator: press buttons, take screenshots, read state.
+"""Drive a running simulator: press buttons, take screenshots, record a GIF.
 
 The simulator can be walked from a shell — the firmware's own HTTP API takes
 button presses, and SIGUSR2 makes the window capture itself — but doing that by
@@ -16,13 +16,17 @@ hand has sharp edges. This wraps them:
     direction of dial rotation and moves the highlight *down* the list. That is
     the device's contract and this does not change it, but it also accepts
     `next` and `prev`, which say what happens on screen.
+  * Recording. `record` runs a walkthrough with the window streaming to disk as
+    raw frames, then hands them to ffmpeg for the GIF — the one part that is
+    not stdlib, and the only thing here that needs a tool on PATH.
 
-Everything is stdlib: this has to run anywhere the simulator builds.
+Everything else is stdlib: this has to run anywhere the simulator builds.
 
     simctl.py start --scene busy
     simctl.py press next ok
     simctl.py shot setup
     simctl.py run next ok shot:theme next shot:second-theme
+    simctl.py record --out demo.gif start wait:3 apps wait:2 next ok wait:2
     simctl.py status
     simctl.py stop
 
@@ -33,7 +37,9 @@ build directory, so later commands need no arguments.
 import argparse
 import json
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -63,6 +69,14 @@ KEY_ALIASES = {
 
 CAPTURE_TIMEOUT = 30.0
 START_TIMEOUT = 60.0
+CONTROL_TIMEOUT = 90.0
+
+# Recording defaults. Twelve frames a second is enough for the wipes and the
+# scrolling labels, and every one of them is a whole window read back off the
+# GPU. The divisor is applied in the simulator, before the frames reach the
+# disk: a canvas is around four megapixels, which is 12 MB a frame raw.
+RECORD_FPS = 12
+RECORD_DIVISOR = 3
 
 
 class SimctlError(RuntimeError):
@@ -116,6 +130,46 @@ def api_is_up(port: int) -> bool:
         return False
 
 
+def control(session: dict, request: str, timeout: float = CONTROL_TIMEOUT) -> list[str]:
+    """Ask the simulator's control socket something and return the reply's words.
+
+    One line in, one line out; see src/sim_control.h. `error ...` comes back as
+    an exception, so callers only ever see a reply that worked.
+    """
+    path = session.get("control")
+    if not path:
+        raise SimctlError("this session has no control socket; start the simulator again")
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
+
+        try:
+            client.connect(path)
+        except OSError as error:
+            raise SimctlError(f"cannot reach the control socket at {path}: {error}")
+
+        client.sendall(request.encode() + b"\n")
+
+        reply = b""
+        while b"\n" not in reply:
+            try:
+                chunk = client.recv(4096)
+            except socket.timeout:
+                raise SimctlError(f"the simulator did not answer {request!r} in {timeout:.0f}s")
+
+            if not chunk:
+                break
+            reply += chunk
+
+    words = reply.decode(errors="replace").split("\n", 1)[0].split()
+    if not words:
+        raise SimctlError(f"the simulator closed the socket without answering {request!r}")
+    if words[0] != "ok":
+        raise SimctlError(" ".join(words[1:]) or "the simulator refused the request")
+
+    return words[1:]
+
+
 def resolve_key(name: str) -> str:
     key = KEY_ALIASES.get(name, name)
     if key not in DEVICE_KEYS:
@@ -145,7 +199,19 @@ def command_start(args) -> int:
     log_path = shots / "sim.log"
     log = log_path.open("wb")
 
-    command = [str(binary), "--screenshot", str(shots), "--api-port", str(args.port)]
+    # Beside the session file rather than in the capture directory: it belongs
+    # to this simulator, and a unix socket path is short enough to run out of.
+    control_path = args.build.resolve() / "simctl-control.sock"
+
+    command = [
+        str(binary),
+        "--screenshot",
+        str(shots),
+        "--api-port",
+        str(args.port),
+        "--control",
+        str(control_path),
+    ]
     if args.scene:
         command += ["--scene", args.scene]
     command += args.extra
@@ -173,6 +239,7 @@ def command_start(args) -> int:
             "shots": str(shots),
             "log": str(log_path),
             "scene": args.scene,
+            "control": str(control_path),
         },
     )
 
@@ -252,11 +319,9 @@ def command_shot(args) -> int:
     return 0
 
 
-def command_run(args) -> int:
-    """A whole walkthrough in one line: keys, `shot`, `shot:label`, `wait:1.5`."""
-    session = read_session(args.build)
-
-    for step in args.steps:
+def walk(session: dict, steps: list[str], settle: float) -> None:
+    """Play a walkthrough: keys, `shot`, `shot:label` and `wait:1.5`."""
+    for step in steps:
         if step == "shot":
             shot(session, None)
         elif step.startswith("shot:"):
@@ -264,7 +329,113 @@ def command_run(args) -> int:
         elif step.startswith("wait:"):
             time.sleep(float(step.split(":", 1)[1]))
         else:
-            press(session, step, args.settle)
+            press(session, step, settle)
+
+
+def command_run(args) -> int:
+    """A whole walkthrough in one line: keys, `shot`, `shot:label`, `wait:1.5`."""
+    walk(read_session(args.build), args.steps, args.settle)
+
+    return 0
+
+
+def encode_gif(
+    raw: Path, gif: Path, width: int, height: int, fps: float, target_width: int
+) -> None:
+    """Turn the raw stream into a GIF.
+
+    The palette is the whole problem: a front panel is a few thousand lit dots
+    on black, and a fixed 256-colour table either loses the dots or loses the
+    device around them. ffmpeg's palettegen reads the frames first and builds
+    the table from what is actually there, and `stats_mode=diff` weights it
+    towards the parts that move — the panels — rather than the case, which
+    never changes. The two passes are one command: `split` feeds the frames to
+    the generator and to the mapper.
+    """
+    if not shutil.which("ffmpeg"):
+        raise SimctlError("ffmpeg is not on PATH; recording needs it to make the GIF")
+
+    scale = f"scale={target_width}:-1:flags=lanczos," if target_width else ""
+    palette = (
+        f"[0:v]{scale}split[frames][sample];"
+        "[sample]palettegen=stats_mode=diff[palette];"
+        "[frames][palette]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle"
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "rawvideo",
+        "-pixel_format", "rgb24",
+        "-video_size", f"{width}x{height}",
+        "-framerate", f"{fps:.3f}",
+        "-i", str(raw),
+        "-filter_complex", palette,
+        "-loop", "0",
+        str(gif),
+    ]
+
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode != 0:
+        raise SimctlError(f"ffmpeg failed: {result.stderr.decode(errors='replace').strip()}")
+
+
+def command_record(args) -> int:
+    """Record the window while a walkthrough plays, and write it as a GIF.
+
+    The simulator streams whole frames; a still would miss the wipe between
+    scenes, the scrolling labels and the timer counting down, which is most of
+    what the interface does.
+    """
+    session = read_session(args.build)
+
+    gif = args.out.resolve()
+    gif.parent.mkdir(parents=True, exist_ok=True)
+
+    # In the capture directory rather than beside the GIF: a minute of raw
+    # frames is hundreds of megabytes, and this is the simulator's own scratch
+    # space. It only outlives the encode with --keep-raw.
+    raw = Path(session["shots"]) / f"{gif.stem}.raw"
+
+    width, height, fps = (int(value) for value in control(
+        session, f"record start {args.fps} {args.divisor} {raw}"))
+    print(f"recording {width}x{height} at {fps} fps")
+
+    try:
+        walk(session, args.steps, args.settle)
+    finally:
+        frames, dropped, width, height, fps, elapsed_ms = (
+            int(value) for value in control(session, "record stop"))
+
+    print(f"captured {frames} frames ({dropped} dropped) in {raw}")
+    if dropped:
+        print("dropped frames are the writer falling behind; try a lower --fps")
+
+    if not frames:
+        raise SimctlError("nothing was recorded")
+
+    # Reading a window back off the GPU costs more than the frame period asks
+    # for, so the stream is usually slower than --fps. Encoding at the rate the
+    # frames were actually spaced by is what keeps the GIF in real time.
+    achieved = (frames - 1) * 1000 / elapsed_ms if frames > 1 and elapsed_ms else float(fps)
+    if abs(achieved - fps) > 0.5:
+        print(f"the window kept up with {achieved:.1f} of the {fps} fps asked for")
+
+    try:
+        encode_gif(raw, gif, width, height, achieved, args.width)
+    except SimctlError:
+        # Whatever went wrong, the frames took a walkthrough to capture and are
+        # worth more than the disk they cost.
+        print(f"keeping {raw}: {width}x{height} rgb24, {fps} fps", file=sys.stderr)
+        raise
+
+    if not args.keep_raw:
+        raw.unlink(missing_ok=True)
+
+    size = gif.stat().st_size
+    print(f"{gif} ({elapsed_ms / 1000:.1f}s, {size / 1024 / 1024:.1f} MB)")
 
     return 0
 
@@ -275,6 +446,8 @@ def command_status(args) -> int:
     print(f"pid {session['pid']}, port {session['port']}")
     print(f"captures {session['shots']}")
     print(f"log      {session['log']}")
+    if session.get("control"):
+        print(f"control  {session['control']}")
 
     status = json.loads(api(session, "/api/status"))
     firmware = status.get("firmware", {})
@@ -340,6 +513,30 @@ def main() -> int:
     run.add_argument("steps", nargs="+")
     run.add_argument("--settle", type=float, default=0.5)
     run.set_defaults(func=command_run)
+
+    record = subparsers.add_parser(
+        "record",
+        help="record the window into a GIF while a walkthrough plays",
+        description="Steps are the same as `run`; `wait:N` alone records N seconds "
+        "of whatever is on screen. Needs ffmpeg on PATH.",
+    )
+    record.add_argument("--out", type=Path, required=True, help="the GIF to write")
+    record.add_argument("--fps", type=int, default=RECORD_FPS, help="frames a second")
+    record.add_argument(
+        "--divisor",
+        type=int,
+        default=RECORD_DIVISOR,
+        help="shrink each frame by this whole factor as it is captured",
+    )
+    record.add_argument(
+        "--width", type=int, default=0, help="scale to this width when encoding"
+    )
+    record.add_argument(
+        "--keep-raw", action="store_true", help="leave the raw frames beside the GIF"
+    )
+    record.add_argument("--settle", type=float, default=0.5)
+    record.add_argument("steps", nargs="+", help="keys, shot[:label] and wait:N")
+    record.set_defaults(func=command_record)
 
     status = subparsers.add_parser("status", help="session and device state")
     status.set_defaults(func=command_status)

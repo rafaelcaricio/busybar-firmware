@@ -19,6 +19,7 @@
 #include "platform_services_host.h"
 #include "scene_host.h"
 #include "services_host.h"
+#include "sim_control.h"
 #include "sim_window.h"
 #include "storage_host.h"
 #include "web_api_host.h"
@@ -75,6 +76,7 @@ static struct {
     const char* keys;
     int api_port;
     bool announce;
+    const char* control_path;
 } config = {
     /* 0 means "as large as the screen allows"; see sim_window_init(). */
     .scale = 0,
@@ -87,6 +89,8 @@ static struct {
     .keys = NULL,
     .api_port = API_PORT_DEFAULT,
     .announce = true,
+    /* Off unless asked for: nothing but the tools speaks it. */
+    .control_path = NULL,
 };
 
 /** Button names accepted by --keys. */
@@ -341,6 +345,8 @@ static void* simulator_scheduler_thread(void* arg) {
         furi_thread_alloc_ex("screenshot", 8 * 1024, simulator_screenshot_thread, NULL);
     furi_thread_start(screenshot);
 
+    if(config.control_path) sim_control_init(config.control_path);
+
     if(config.exit_after_frames) {
         FuriThread* capture =
             furi_thread_alloc_ex("capture", 8 * 1024, simulator_capture_thread, NULL);
@@ -380,6 +386,8 @@ static void simulator_print_usage(const char* argv0) {
         "                    and any time F12 or SIGUSR2 arrives (default: .)\n"
         "      --api-port N  serve the device HTTP API on N (default 8042, 0 disables)\n"
         "      --no-mdns     do not announce the simulator on the local network\n"
+        "      --control PATH  serve the tools' control socket, which is what\n"
+        "                    records the window; see simctl.py record\n"
         "  -h, --help        this message\n"
         "\n"
         "Environment:\n"
@@ -401,6 +409,7 @@ int main(int argc, char** argv) {
         {"list-apps", no_argument, NULL, 'l'},
         {"api-port", required_argument, NULL, 'a'},
         {"no-mdns", no_argument, NULL, 'm'},
+        {"control", required_argument, NULL, 'c'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -431,6 +440,9 @@ int main(int argc, char** argv) {
             break;
         case 'm':
             config.announce = false;
+            break;
+        case 'c':
+            config.control_path = optarg;
             break;
         case 'l':
             scene_host_list_apps();

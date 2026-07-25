@@ -41,9 +41,22 @@ line. Each capture prints the three files it wrote; read them.
 | `press KEY...` | one or more buttons |
 | `shot [LABEL]` | capture, wait for the encode, print the paths |
 | `run STEP...` | keys, `shot`, `shot:label`, `wait:N` in sequence |
+| `record --out FILE.gif STEP...` | the same steps, with the window recorded to a GIF |
 | `status` | pid, port, capture directory, firmware version, uptime |
 | `log [--lines N]` | tail the simulator's output |
 | `stop` | end the session |
+
+`record` is for the things a still cannot show — a wipe between scenes, a label
+scrolling because it does not fit, a timer counting down — and for showing
+someone the change rather than describing it. It needs ffmpeg on PATH:
+
+```sh
+simulator/tools/simctl.py record --out /tmp/demo.gif wait:1 start wait:4 apps wait:2
+simulator/tools/simctl.py record --out /tmp/idle.gif wait:15   # no buttons, just time
+```
+
+Judge a layout from `back.png` and `front.png` — a GIF is scaled down and
+palettised, so it is the wrong thing to check a one-pixel misalignment in.
 
 Each capture writes three files. **`back.png` and `front.png` are the ones to
 read**: they are the framebuffers magnified pixel for pixel, so text is legible

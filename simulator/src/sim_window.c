@@ -3,6 +3,7 @@
 #include "sim_background.h"
 #include "sim_controls.h"
 #include "sim_led_panel.h"
+#include "sim_recorder.h"
 
 #include <front_display/front_display.h>
 #include <back_display/back_display.h>
@@ -553,6 +554,17 @@ bool sim_window_pump(void) {
     }
     pthread_mutex_unlock(&sim.lock);
 
+    /* A recording reads the same finished frame back, into buffers the
+     * recorder allocated when it started: nothing here allocates, and a frame
+     * the writer has no room for is dropped rather than stalling the loop. */
+    uint8_t* recording = sim_recorder_frame_due(sim.canvas_w, sim.canvas_h, SDL_GetTicks64());
+    if(recording) {
+        const SDL_Rect area = {0, 0, sim.canvas_w, sim.canvas_h};
+        SDL_RenderReadPixels(
+            sim.renderer, &area, SDL_PIXELFORMAT_RGB24, recording, sim.canvas_w * 3);
+        sim_recorder_frame_ready();
+    }
+
     SDL_RenderPresent(sim.renderer);
 
     return true;
@@ -659,6 +671,13 @@ void sim_window_inject_key(uint8_t key, bool pressed) {
 void sim_window_request_quit(void) {
     pthread_mutex_lock(&sim.lock);
     sim.quit_requested = true;
+    pthread_mutex_unlock(&sim.lock);
+}
+
+void sim_window_canvas_size(int* width, int* height) {
+    pthread_mutex_lock(&sim.lock);
+    *width = sim.canvas_w;
+    *height = sim.canvas_h;
     pthread_mutex_unlock(&sim.lock);
 }
 
