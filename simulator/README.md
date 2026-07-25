@@ -3,14 +3,20 @@
 Runs the firmware's GUI stack and real applications on macOS/Linux against an
 SDL window, so a UI change can be looked at before it is flashed.
 
-![The simulator running the Busy app: the front LED matrix showing the Lunch theme, the back panel counting down, and the control deck standing in for the device's top surface](docs/window.jpg)
+<p align="center">
+  <img src="docs/window.jpg" width="680"
+       alt="The simulator running the Busy app: the front LED matrix showing the Lunch theme, the back panel counting down, and the control deck standing in for the device's top surface">
+</p>
 
 Both displays are drawn where they sit on the hardware, on renders of the
 device. The front panel is a grid of 72x16 discrete LEDs, not a screen, and is
 drawn as one — unlit dots and all — so what you see is close to what the
 hardware does with the same framebuffer.
 
-![Five front panels stacked: the Meeting, On Call, Keep Out and Lunch themes, and the clock app](docs/front-panel.jpg)
+<p align="center">
+  <img src="docs/front-panel.jpg" width="420"
+       alt="Five front panels stacked: the Meeting, On Call, Keep Out and Lunch themes, and the clock app">
+</p>
 
 Every image in this file is an unretouched capture, taken with
 `tools/simctl.py` (see [Walking the UI](#walking-the-ui-toolssimctlpy)).
