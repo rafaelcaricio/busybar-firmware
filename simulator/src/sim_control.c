@@ -1,5 +1,7 @@
 #include "sim_control.h"
+#include "platform_services_host.h"
 #include "sim_recorder.h"
+#include "sim_window.h"
 
 #include <furi.h>
 
@@ -132,9 +134,140 @@ static void sim_control_record_status(int client) {
     sim_control_reply(client, reply);
 }
 
+static void sim_control_status(int client) {
+    extern size_t xPortGetFreeHeapSize(void);
+    extern size_t xPortGetMinimumEverFreeHeapSize(void);
+
+    SimWindowStatus status;
+    sim_window_status(&status);
+
+    char reply[256];
+    snprintf(
+        reply,
+        sizeof(reply),
+        "ok %llu %llu %llu %d %d %d %zu %zu",
+        (unsigned long long)status.frames,
+        (unsigned long long)status.front_updates,
+        (unsigned long long)status.back_updates,
+        status.canvas_width,
+        status.canvas_height,
+        status.quitting ? 1 : 0,
+        xPortGetFreeHeapSize(),
+        xPortGetMinimumEverFreeHeapSize());
+    sim_control_reply(client, reply);
+}
+
+static void sim_control_power_status(int client) {
+    uint8_t charge = 0;
+    bool usb = false;
+    bool charging = false;
+    platform_services_host_get_power(&charge, &usb, &charging);
+
+    char reply[64];
+    snprintf(
+        reply,
+        sizeof(reply),
+        "ok %u %d %d",
+        charge,
+        usb ? 1 : 0,
+        charging ? 1 : 0);
+    sim_control_reply(client, reply);
+}
+
+static void sim_control_power_set(int client, const char* arguments) {
+    unsigned charge = 0, usb = 0, charging = 0;
+    char extra = '\0';
+    if(sscanf(arguments, "%u %u %u %c", &charge, &usb, &charging, &extra) != 3 ||
+       charge > 100 || usb > 1 || charging > 1 || (!usb && charging)) {
+        sim_control_reply(
+            client,
+            "error usage: power CHARGE USB CHARGING (charge 0..100; flags 0 or 1)");
+        return;
+    }
+
+    platform_services_host_set_power((uint8_t)charge, usb != 0, charging != 0);
+    sim_control_power_status(client);
+}
+
+static void sim_control_wait_frame(int client, const char* arguments) {
+    unsigned long long target = 0;
+    unsigned timeout_ms = 0;
+    char extra = '\0';
+
+    if(sscanf(arguments, "%llu %u %c", &target, &timeout_ms, &extra) != 2 ||
+       timeout_ms == 0 || timeout_ms > 600000) {
+        sim_control_reply(client, "error usage: wait frame TARGET TIMEOUT_MS (1..600000)");
+        return;
+    }
+
+    if(!sim_window_wait_for_frame((uint64_t)target, timeout_ms)) {
+        SimWindowStatus status;
+        sim_window_status(&status);
+
+        char reply[160];
+        snprintf(
+            reply,
+            sizeof(reply),
+            "error timed out at frame %llu waiting for %llu",
+            (unsigned long long)status.frames,
+            target);
+        sim_control_reply(client, reply);
+        return;
+    }
+
+    SimWindowStatus status;
+    sim_window_status(&status);
+    char reply[96];
+    snprintf(reply, sizeof(reply), "ok %llu", (unsigned long long)status.frames);
+    sim_control_reply(client, reply);
+}
+
+/** "screenshot DIRECTORY", where DIRECTORY is the rest of the line. */
+static void sim_control_screenshot(int client, const char* directory) {
+    if(!*directory) {
+        sim_control_reply(client, "error usage: screenshot DIRECTORY");
+        return;
+    }
+
+    unsigned sequence = 0;
+    uint64_t frame = 0;
+    if(!sim_window_screenshot_next(directory, &sequence, &frame)) {
+        sim_control_reply(client, "error screenshot failed; see simulator log");
+        return;
+    }
+
+    char reply[96];
+    snprintf(
+        reply,
+        sizeof(reply),
+        "ok %u %llu",
+        sequence,
+        (unsigned long long)frame);
+    sim_control_reply(client, reply);
+}
+
 static void sim_control_dispatch(int client, char* line) {
     if(strcmp(line, "ping") == 0) {
         sim_control_reply(client, "ok");
+
+    } else if(strcmp(line, "status") == 0) {
+        sim_control_status(client);
+
+    } else if(strcmp(line, "power") == 0) {
+        sim_control_power_status(client);
+
+    } else if(strncmp(line, "power ", 6) == 0) {
+        sim_control_power_set(client, line + 6);
+
+    } else if(strncmp(line, "wait frame ", 11) == 0) {
+        sim_control_wait_frame(client, line + 11);
+
+    } else if(strncmp(line, "screenshot ", 11) == 0) {
+        sim_control_screenshot(client, line + 11);
+
+    } else if(strcmp(line, "quit") == 0) {
+        sim_control_reply(client, "ok");
+        sim_window_request_quit();
 
     } else if(strncmp(line, "record start ", 13) == 0) {
         sim_control_record_start(client, line + 13);

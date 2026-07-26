@@ -35,9 +35,11 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
 
     names = []
+    expected_sources = set()
     for png in sorted(args.images.glob("*.png")):
         name = f"I_{png.stem}"
         target = args.out / f"{name}.c"
+        expected_sources.add(target)
 
         image = LVGLImage().from_png(str(png), cf=COLOR_FORMAT)
         image.adjust_stride(align=1)
@@ -45,12 +47,16 @@ def main() -> int:
 
         names.append(name)
 
+    for stale in args.out.glob("I_*.c"):
+        if stale not in expected_sources:
+            stale.unlink()
+
     header = args.out / "assets_images.h"
-    with header.open("w") as out:
-        out.write("#pragma once\n\n")
-        out.write("#include <lvgl.h>\n\n")
-        for name in names:
-            out.write(f"extern const lv_image_dsc_t {name};\n")
+    header_text = "#pragma once\n\n#include <lvgl.h>\n\n" + "".join(
+        f"extern const lv_image_dsc_t {name};\n" for name in names
+    )
+    if not header.exists() or header.read_text() != header_text:
+        header.write_text(header_text)
 
     print(f"generated {len(names)} internal images into {args.out}")
     return 0

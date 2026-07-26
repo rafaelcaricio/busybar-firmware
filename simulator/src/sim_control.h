@@ -10,6 +10,12 @@
  * Requests, with the reply each gives:
  *
  *   ping                                 ok
+ *   status                               ok FRAMES FRONT_UPDATES BACK_UPDATES WIDTH HEIGHT QUITTING HEAP_FREE HEAP_MIN
+ *   power                                ok CHARGE USB CHARGING
+ *   power CHARGE USB CHARGING            ok CHARGE USB CHARGING
+ *   wait frame TARGET TIMEOUT_MS         ok CURRENT_FRAME
+ *   screenshot DIRECTORY                 ok SEQUENCE CAPTURED_FRAME
+ *   quit                                 ok
  *   record start FPS DIVISOR PATH        ok WIDTH HEIGHT FPS
  *   record stop                          ok FRAMES DROPPED WIDTH HEIGHT FPS ELAPSED_MS
  *   record status                        ok RUNNING FRAMES DROPPED WIDTH HEIGHT FPS ELAPSED_MS

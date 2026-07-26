@@ -18,7 +18,9 @@
 #include <web_server_i.h>
 #include <http_api/http_api.h>
 
+#include <ctype.h>
 #include <stdio.h>
+#include <string.h>
 
 #define TAG "WebApiHost"
 
@@ -28,8 +30,37 @@ static struct {
     int accesslog_level;
 } web_api_host;
 
-void web_api_host_init(uint16_t port) {
-    snprintf(web_api_host.listen_url, sizeof(web_api_host.listen_url), "http://0.0.0.0:%u", port);
+bool web_api_host_init(uint16_t port, const char* address) {
+    if(!address || !*address || strstr(address, "://") || strchr(address, '/') ||
+       strchr(address, '[') || strchr(address, ']')) {
+        FURI_LOG_E(TAG, "invalid listen address");
+        return false;
+    }
+    for(const char* cursor = address; *cursor; cursor++) {
+        if(isspace((unsigned char)*cursor)) {
+            FURI_LOG_E(TAG, "invalid listen address");
+            return false;
+        }
+    }
+
+    const int length =
+        strchr(address, ':') ?
+            snprintf(
+                web_api_host.listen_url,
+                sizeof(web_api_host.listen_url),
+                "http://[%s]:%u",
+                address,
+                port) :
+            snprintf(
+                web_api_host.listen_url,
+                sizeof(web_api_host.listen_url),
+                "http://%s:%u",
+                address,
+                port);
+    if(length < 0 || length >= (int)sizeof(web_api_host.listen_url)) {
+        FURI_LOG_E(TAG, "listen address is too long");
+        return false;
+    }
 
     /* Sets mongoose's log level. On the device the network startup calls this;
      * there is no network service here, and without it mongoose defaults to
@@ -39,6 +70,7 @@ void web_api_host_init(uint16_t port) {
     furi_record_create(RECORD_NETWORK, &web_api_host.network_instance);
 
     FURI_LOG_I(TAG, "http api on %s", web_api_host.listen_url);
+    return true;
 }
 
 const char* web_srv_host_listen_url(void) {
@@ -112,4 +144,3 @@ void sysctl_set_websrv_accesslog_level(int level) {
 const char* intercom_get_version_string(void) {
     return "";
 }
-

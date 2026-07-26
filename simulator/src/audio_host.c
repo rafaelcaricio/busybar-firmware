@@ -82,7 +82,10 @@ bool audio_host_play_file(const char* device_path) {
     if(!audio_host_open()) return false;
 
     char resolved[1024];
-    storage_host_resolve_path(device_path, resolved, sizeof(resolved));
+    if(!storage_host_resolve_path(device_path, resolved, sizeof(resolved))) {
+        FURI_LOG_W(TAG, "audio asset not found: %s", device_path);
+        return false;
+    }
 
     FILE* stream = fopen(resolved, "rb");
     if(!stream) {

@@ -1,0 +1,69 @@
+name: Simulator
+
+on:
+  pull_request:
+  push:
+    branches:
+      - dev
+      - simulator
+
+concurrency:
+  group: simulator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Initialize simulator submodules
+        run: |
+          git submodule update --init --recursive --depth 1 \
+            assets/proto \
+            fbt_layers/core_libs \
+            fbt_layers/freertos \
+            lib/cjson \
+            lib/lvgl \
+            lib/mongoose \
+            lib/nanopb \
+            lib/stb/stb_repo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            ffmpeg \
+            libavahi-compat-libdnssd-dev \
+            libsdl2-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg ninja pkg-config sdl2
+
+      - name: Configure
+        run: cmake -S simulator -B simulator/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build simulator/build-ci
+
+      - name: Smoke test
+        run: ctest --test-dir simulator/build-ci --output-on-failure

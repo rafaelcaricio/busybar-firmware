@@ -35,30 +35,44 @@ the real scene managers and the real busy timer, and started by the real
 of the workstation's speakers. The device's HTTP API is served too — the
 firmware's own `web_server` service, on the workstation's sockets, including
 the protobuf state stream on `/api/status/ws` — so `busylib` and anything else
-that speaks to a Busy Bar can be pointed at the simulator, or left to find it
-over mDNS.
+that speaks to a Busy Bar can be pointed at the simulator. Network discovery is
+available explicitly with `--network` or `--mdns`.
 
 What is faked: the two display drivers push pixels into an SDL texture instead
 of SPI, an on-screen control deck and the keyboard stand in for the buttons,
-storage is the workstation filesystem, the RTC is the workstation clock, and
-everything needing a radio or a server — Wi-Fi, BLE, Matter, MQTT, OTA — is an
-inert stand-in. That is the whole of the substitution; see `shim/` and `src/`,
-and "What the apps are talking to" below for which is which.
+storage is an immutable generated tree plus a writable workstation overlay, and
+the RTC starts from the workstation clock. Brightness and timezone settings use
+the firmware's real services and persist in that overlay. Everything needing a
+radio or a remote server — Wi-Fi, BLE, Matter, MQTT, OTA — remains an inert
+stand-in. See `shim/` and `src/`, and "What the apps are talking to" below for
+which is which.
 
 ## Build and run
 
-Requires SDL2, CMake, Ninja and `uv`. ffmpeg is optional: the build uses it to
-convert the sounds, and [recording](#recording-simctlpy-record) to make the
-GIF; everything else works without it.
+Requires SDL2, CMake and `uv`; Ninja is preferred. Linux also needs the
+DNS-SD/Avahi compatibility development package. ffmpeg is optional: the build
+uses it to convert sounds, and
+[recording](#recording-simctlpy-record) uses it to make a GIF.
+
+```sh
+simulator/tools/simctl.py doctor
+simulator/tools/simctl.py build --test
+./simulator/build/busybar-sim --scene clock
+```
+
+The equivalent manual build is:
 
 ```sh
 cmake -S simulator -B simulator/build -G Ninja
 cmake --build simulator/build
-./simulator/build/busybar-sim --scene clock
+ctest --test-dir simulator/build --output-on-failure
 ```
 
-Reconfigure rather than rebuild after changing anything under `assets/` or an
-app's `resources/`: the asset tree is generated at configure time.
+Generated sources, app manifests, protobufs, backgrounds and runtime assets are
+tracked build dependencies. A plain `cmake --build simulator/build` notices
+changes under `assets/` and application `resources/`; no manual reconfigure is
+needed. Git metadata is refreshed on every build when `git` is available and
+falls back to `unknown` for source archives and minimal build containers.
 
 To check a change by looking at it instead of by hand, see
 [Walking the UI](#walking-the-ui-toolssimctlpy) — `tools/simctl.py` starts a
@@ -69,19 +83,31 @@ The submodules the simulator needs are `lib/lvgl`, `lib/cjson`, `lib/mongoose`,
 `fbt_layers/freertos` (the last two recursively). CMake names the missing one
 if any of them is empty.
 
+The CTest smoke regression is headless and end to end: it boots applications,
+waits on rendered-frame revisions, exercises the real HTTP API, checks all five
+PNG dimensions at a large window scale, verifies capture does not consume the
+furi heap, checks immutable-storage containment, injects a signed low-battery
+state, and restarts against the same overlay to prove brightness and timezone
+persistence. `.github/workflows/simulator.yml` runs that path on macOS and
+Ubuntu.
+
 Options:
 
 | Flag | Meaning |
 | --- | --- |
 | `--scene NAME` | app to boot into, or `demo` for the widget demo; by default the mode selector decides |
 | `-s, --scale N` | pixels per front LED; the default fills the screen, and the window is resizable |
-| `--frames N` | run N frames then exit |
+| `--frames N` | present exactly N rendered frames after startup, then exit |
 | `--keys LIST` | replay buttons before exiting, e.g. `up,ok` |
-| `--screenshot DIR` | where captures go: on exit with `--frames`, and whenever F12 or SIGUSR2 arrives |
+| `--screenshot DIR` | where the five coherent panel/window captures go: on exit with `--frames`, and whenever F12 or SIGUSR2 arrives |
 | `--list-apps` | print every app that can be given to `--scene` |
 | `--api-port N` | serve the device HTTP API on N, default 8042; `0` disables |
-| `--no-mdns` | do not announce the simulator on the local network |
-| `--control PATH` | serve the tools' control socket, which is what records the window |
+| `--listen ADDR` | bind the API to this address; default `127.0.0.1` |
+| `--network` | bind to all IPv4 interfaces and enable mDNS |
+| `--mdns` / `--no-mdns` | enable/disable discovery; disabled by default |
+| `--state-dir DIR` | writable state overlay; default is a fresh temporary directory |
+| `--headless` | use SDL's software-only dummy video driver |
+| `--control PATH` | serve the tools' deterministic control socket |
 | `-v, --verbose` | furi logging at trace level |
 
 With no `--scene`, the simulator boots the way the device does: the startup app
@@ -90,10 +116,12 @@ picks a different app to land on without pinning it there — moving the lever
 still switches away, which is what the desktop service does for any app started
 from somewhere other than the selector.
 
-`BUSYBAR_SIM_ASSETS` overrides the asset root; it defaults to the tree CMake
-builds under `build/assets_root`, which mirrors the device layout so
+`BUSYBAR_SIM_ASSETS` overrides the immutable asset root; it defaults to the
+tree CMake builds under `build/assets_root`, which mirrors the device layout so
 `/ext/apps_assets/shared/fonts/...` and `/ext/apps_assets/clock/images/...`
-both resolve.
+both resolve. `BUSYBAR_SIM_STATE` supplies a persistent writable overlay, and
+`--state-dir` takes precedence. Without either, each run gets isolated
+temporary state.
 
 The tree carries two kinds of file. Most are build products — fonts, `.image`,
 `.anim`, `.snd` — converted from `assets/` by `tools/gen_runtime_assets.py`.
@@ -171,7 +199,7 @@ clock                  app        Clock
 ...
 ```
 
-That list is generated at configure time from the same `application.fam`
+That list is generated during the build from the same `application.fam`
 manifests fbt reads, so `FLIPPER_APPS`, `FLIPPER_SETTINGS_APPS` and the rest
 hold what the simulator actually links — which is why the settings menu
 enumerates the real settings apps and the debug app list the real debug apps.
@@ -191,10 +219,11 @@ To run any of these headlessly and look at the result:
     --screenshot /tmp/shots
 ```
 
-`front.png` and `back.png` are the framebuffers magnified pixel for pixel —
-no LED rendering, so they are the right thing to inspect a layout in.
-`window.png` is the whole window, which is the only one that shows the
-presentation itself:
+Each capture is one coherent render pass. `front-raw.png` and `back-raw.png`
+are the exact physical framebuffers (72x16 and 160x80). `front.png` is a fixed
+8x magnification (576x128), and `back.png` is a fixed 4x magnification
+(640x320), so layout evidence does not depend on monitor size or window scale.
+`window.png` is the whole window and shows the device presentation:
 
 <p align="center">
   <img src="docs/window.jpg" width="680"
@@ -207,49 +236,66 @@ presentation itself:
 receives **F12** or **SIGUSR2**, into `--screenshot`'s directory or the working
 directory, and the firmware's own HTTP API takes button presses. Together that
 is enough to walk the interface from a shell, which beats guessing at a
-`--keys` string and re-running from boot each time.
+`--keys` string and re-running from boot each time. The driver uses a private
+control socket as well, so frame waits, screenshots and shutdown have explicit
+acknowledgements.
 
-`tools/simctl.py` drives it. Nothing but the standard library, so it runs
-wherever the simulator builds:
+`tools/simctl.py` diagnoses, builds and drives it. Nothing but the standard
+library is needed except ffmpeg for GIF encoding:
 
 ```sh
-simulator/tools/simctl.py start --scene busy --shots /tmp/shots
-simulator/tools/simctl.py run next ok shot:setup next ok shot:theme
+simulator/tools/simctl.py doctor
+simulator/tools/simctl.py build --test
+simulator/tools/simctl.py start --scene busy --shots /tmp/shots --port 0
+simulator/tools/simctl.py run next ok frames:30 shot:setup next ok shot:theme
 simulator/tools/simctl.py log --lines 40
 simulator/tools/simctl.py stop
 ```
 
 | command | |
 | --- | --- |
-| `start [--scene NAME] [--shots DIR] [--port N]` | launch, and wait for the API to answer |
+| `doctor` | probe the real CMake dependency/submodule path in a temporary directory |
+| `build [--test]` | configure and build; optionally run the end-to-end smoke regression |
+| `start [--scene NAME] [--shots DIR] [--port N] [--state-dir DIR]` | launch and wait for the API, both displays and stable presented frames; port `0` selects an available loopback port |
 | `press KEY...` | one or more buttons |
-| `shot [LABEL]` | capture, wait for it to land, print the paths |
-| `run STEP...` | keys, `shot`, `shot:label` and `wait:N` in sequence |
+| `shot [LABEL]` | synchronously capture one coherent render and print its five paths |
+| `run STEP...` | keys, `shot`, `shot:label`, `frames:N` and `wait:N` in sequence |
 | `record --out FILE.gif STEP...` | record the window while those steps play |
-| `status` | the session, plus the device's own `/api/status` |
+| `status` | session, render revisions, heap usage, and the device's own `/api/status` |
+| `power [--charge N] [--usb connected\|disconnected] [--charging yes\|no]` | inspect or inject battery/USB scenarios |
 | `log [--lines N]` | tail the simulator's output |
-| `stop` | end the session |
+| `stop` | request a graceful shutdown and clean tool-owned temporary state |
 
-The session — pid, port, capture directory — lives in `build/`, so everything
-after `start` takes no arguments. Captures are numbered `window-001.png` and so
-on; a label renames them to `<label>-window.png` instead.
+The session — process identity, port, capture directory, control socket and
+state root — lives in `build/`, so everything after `start` takes no arguments.
+Without `--state-dir`, `stop` removes a fresh tool-owned state directory; an
+explicit state directory survives. Captures are numbered `front-raw-001.png`,
+`back-raw-001.png`, `front-001.png`, `back-001.png` and `window-001.png`; a
+label renames them to `<label>-<kind>.png`.
+An existing labeled capture is never overwritten.
 
-Three things it exists to get right:
+Four things it exists to get right:
 
 - **Key names.** `/api/input` speaks the *device's* names, where `up` is a
   direction of dial rotation and moves the highlight *down* — the same
   inversion described under Controls above. `simctl.py` passes `up` and `down`
   through untouched, and also accepts `next` and `prev`, which say what happens
   on screen.
-- **Waiting for a capture.** An encode is a couple of seconds, nearly all of it
-  the window. `shot` waits for the simulator's own "wrote" line rather than
-  sleeping, so a capture is never read half-written.
-- **Waiting for startup.** `start` polls `/api/status` instead of guessing how
-  long boot takes.
+- **Exact frame waits.** `frames:N`, duration waits and per-key settling wait
+  for presented frame counters. They do not depend on client-side sleeps or
+  workstation speed.
+- **Coherent captures.** All five images come from the same render pass, and
+  the control reply is sent only after every PNG is complete.
+- **Waiting for startup.** `start` requires `/api/status`, both framebuffer
+  revisions, valid canvas dimensions and two subsequent presents. Returning
+  means the simulator is ready to automate, not merely listening on a socket.
 
-Both triggers only raise a flag; the encoding happens in a task, because
-lodepng allocates from furi's heap. SIGUSR2 rather than SIGUSR1 because the
-FreeRTOS port resumes tasks with that one.
+The F12/SIGUSR2 compatibility triggers only raise a flag; encoding happens in a
+task so it cannot stall SDL's event/present loop. Codec workspace is allocated
+from host virtual memory rather than the measured furi heap. SIGUSR2 rather
+than SIGUSR1 because the FreeRTOS port resumes tasks with that one.
+`simctl.py shot` uses the synchronous control request instead of scraping logs
+from those triggers.
 
 There is a skill for this at `.claude/skills/busybar-simulator/`, which is the
 same workflow written for an agent.
@@ -319,24 +365,29 @@ before trusting what it shows.
 manager, `busy_timer` — the countdown service is compiled and run as-is,
 because it needs only the RTC and records that already exist, so the Busy app's
 timing behaves as it does on the device — and `desktop`, `loader`, `canvas`,
-`log_storage` and `state_publisher`. Audio is real too: `audio_play_file()`
-reaches the workstation's sound device (see below).
+`log_storage`, `state_publisher` and `brightness_control`. Brightness and time
+settings use their real firmware codecs and survive a run when a persistent
+state directory is used. Audio is real too: `audio_play_file()` reaches the
+workstation's sound device (see below).
 
-**Substituted.** Displays go to SDL, buttons come from the control deck,
-storage is the filesystem, the RTC is the host clock. The HTTP API is the
-firmware's own server on host sockets rather than lwIP; `src/web_api_host.c`
-answers for the network stack and the load estimator that the handlers consult,
-and `src/discovery_host.c` announces over the platform's mDNS responder rather
-than lwIP's.
+**Substituted.** Displays go to SDL and apply the firmware's requested front
+brightness, back contrast and sleep state; buttons come from the control deck.
+Storage is a read-only generated asset tree layered under a writable state
+directory. The RTC begins at UTC host time, observes API-set offsets, and the
+time service applies the configured timezone. Power is a thread-safe host
+model whose charge/USB/charging states can be injected through `simctl.py
+power`. The HTTP API is the firmware's own server on host sockets rather than
+lwIP; `src/web_api_host.c` answers for the network stack and load estimator,
+and opt-in discovery uses the platform's mDNS responder.
 
 **Inert.** `src/platform_services_host.c` stands in for everything that needs a
-radio or a server: Wi-Fi, BLE, Matter, MQTT, the OTA updater, status lights,
-brightness, and the version/OTP HAL. Each is an object of the right shape that
-always reports the same disconnected, idle, factory state. The screens draw and
-navigate correctly, and they draw their *disconnected* branches — you will not
-see a connected Wi-Fi screen here, because nothing ever connects. Calls that
-would touch hardware log at info level rather than silently doing nothing, so
-the log shows when a screen tried something real.
+radio or a server: Wi-Fi, BLE, Matter, MQTT, the OTA updater, status lights and
+the OTP parts of the version HAL. Each is an object of the right shape that
+reports a disconnected, idle state. The screens draw and navigate correctly,
+and they draw their *disconnected* branches — you will not see a connected
+Wi-Fi screen here, because nothing ever connects. Calls that would touch
+hardware log at info level rather than silently doing nothing, so the log shows
+when a screen tried something real.
 
 The version record is not inert: `CMakeLists.txt` generates `version.inc.h`
 from git the way fbt does, so the About screen shows the real branch and commit.
@@ -354,17 +405,18 @@ device's small speaker and is wrong for desk speakers. And there is no mixing:
 a sound started while another plays is queued behind it, which is what the
 device's codec does too.
 
-ffmpeg is needed at configure time for this; without it the sounds are skipped
+ffmpeg is used during asset generation for this; without it sounds are skipped
 and the build still succeeds.
 
 ## The HTTP API
 
-The simulator serves the device's REST API on `0.0.0.0:8042`. It is not a
-reimplementation: `applications/services/web_server` and all eighteen of its
-`http_api/api_*.c` handlers are compiled and run here, and mongoose needs no
-porting — it detects the host as `MG_ARCH_UNIX` and uses ordinary BSD sockets
-where on the device it runs over lwIP. Routing, JSON parsing, validation and
-error codes are the firmware's.
+The simulator serves the device's REST API on `127.0.0.1:8042` by default. It
+is not a reimplementation: `applications/services/web_server` and all eighteen
+of its `http_api/api_*.c` handlers are compiled and run here, and mongoose uses
+ordinary BSD sockets where the device uses lwIP. Routing, JSON parsing,
+validation and error codes are the firmware's. Loopback is the safe default;
+use `--network`, or an explicit `--listen`, only when another machine should
+reach it.
 
 So a client is pointed at the simulator by changing one string:
 
@@ -382,20 +434,21 @@ Two runnable examples, neither of them simulator-specific:
 - `examples/watch_state.py` — find the device over mDNS, then follow its state
   stream. Move the mode lever in the window and the events appear.
 
-Port 8042 rather than the device's 80: binding 80 needs root, and a high port
-lets two simulators run side by side. `--api-port 0` turns the server off.
+Port 8042 rather than the device's 80: binding 80 needs root. Give independent
+runs different ports; `simctl.py start --port 0` selects an available one.
+The binary's `--api-port 0` turns the server off.
 
 What is served, and how real it is:
 
 | Route | Behaviour |
 | --- | --- |
-| `/api/display/*` | Real. The canvas service is compiled in, so priority arbitration against the running app works as it does on the device. |
-| `/api/assets/*`, `/api/storage/*` | Real, against the asset tree under `build/assets_root`. |
+| `/api/display/*` | Real. Canvas arbitration and the brightness service are compiled in; requested brightness/contrast changes are visible in captures. |
+| `/api/assets/*`, `/api/storage/*` | Real routing and validation against the immutable asset tree plus writable state overlay. Base assets cannot be removed or overwritten. |
 | `/api/audio/play`, `/api/audio/stop` | Real; sound comes out of the workstation's speakers. |
 | `/api/input` | Real. A key is injected into the same queue the keyboard feeds, so the UI cannot tell it apart from a keypress. |
 | `/api/screen` | Real, the actual framebuffer. |
 | `/api/busy/*` | Real; `busy_timer` is the firmware's own service. |
-| `/api/version`, `/api/status`, `/api/name`, `/api/time` | Real values — git commit, uptime, host clock. |
+| `/api/version`, `/api/status`, `/api/name`, `/api/time` | Real host-backed values — fresh git metadata, uptime, injected power, adjustable clock and persisted timezone. |
 | `/api/log_dump` | Real; `log_storage` is compiled in and captures the simulator's log. |
 | `/api/wifi/*`, `/api/ble/*`, `/api/smart_home/*`, `/api/account` | Answered from the inert services: scans come back empty, connects fail, settings round-trip in memory. |
 | `/api/update/*` | Answered, and refuses to install. There is no firmware image this process could reboot into. |
@@ -439,8 +492,10 @@ them.
 
 ### Discovery
 
-The simulator announces itself over mDNS, so `BusyBarDevices.discover()` finds
-it:
+Discovery is off by default. `--network` binds the API to all IPv4 interfaces
+and announces it over mDNS, so `BusyBarDevices.discover()` can find it.
+`--mdns` enables only the announcement and is useful alongside a deliberate
+`--listen` choice:
 
 ```python
 from busylib.devices import BusyBarDevices
@@ -468,8 +523,8 @@ end in `-sim-<hostname>`, both carry a `simulator=1` TXT record, and the
 advertised name is whatever the device name is set to — "BUSY Simulator" out of
 the box. The hostname suffix also keeps two simulators on one network apart.
 
-`--no-mdns` turns the announcements off; `--api-port 0` turns off the server and
-the announcements with it.
+`--no-mdns` explicitly keeps announcements off (and is accepted for
+compatibility); `--api-port 0` turns off the server and announcements with it.
 
 Announcing goes through the platform's own responder — mDNSResponder on macOS,
 avahi's compatibility layer on Linux — rather than lwIP's, which the device
@@ -513,8 +568,8 @@ being readable.
 
 The only PNG decoder linked in is LVGL's lodepng, which allocates through
 `lv_malloc`, and the window is built before the scheduler starts. So
-`tools/gen_panel_backgrounds.py` strips both renders to headerless RGB24 at
-configure time and the window reads them straight into a locked SDL texture.
+`tools/gen_panel_backgrounds.py` strips both renders to headerless RGB24 as a
+tracked build step, and the window reads them straight into a locked SDL texture.
 Replacing a render means replacing the PNG in `assets/` and re-measuring the
 rectangles in `sim_background.c`; a `static_assert` on the image dimensions
 fails the build if you change one without the other.
@@ -538,16 +593,17 @@ whole effect is a handful of draw calls a frame and is rebuilt only when the
 window is resized. Below four pixels per LED there is no room for a dot and the
 cells are filled solid instead.
 
-The back panel is a greyscale display rather than a matrix — the firmware sets
-its contrast, not its brightness — so it is drawn as it is.
+The back panel is a greyscale display rather than a matrix. The host driver
+applies the firmware's requested contrast and reference-counted sleep state
+before the texture is presented.
 
 ## How it fits together
 
 Three kinds of thread:
 
 - **main** — SDL only: window, event pump, present. It blocks every signal
-  except `SIGINT` *before* `SDL_Init`, so that the threads SDL and AppKit
-  create inherit the mask. The tick handler switches context and then suspends
+  except `SIGINT` and `SIGTERM` *before* `SDL_Init`, so that the threads SDL
+  and AppKit create inherit the mask. The tick handler switches context and then suspends
   the thread it ran on, so a tick caught by a thread that is not a FreeRTOS
   task parks that thread on some task's condvar and deadlocks the scheduler.
   The port is also patched to aim the tick at one thread — see below — which
@@ -568,14 +624,16 @@ stops.
 Pixels are the only thing crossing between SDL and FreeRTOS, copied under a
 plain pthread mutex. No furi primitive is touched from the main thread and no
 SDL handle from a task. Screenshots are the one place the two must meet: the
-window read-back happens on the SDL thread, while the PNG encoder allocates
-from furi's heap and so runs in a task, with a flag as the handshake.
+window read-back happens on the SDL thread, while PNG encoding runs in a task,
+with a flag as the handshake. Raw captures, magnification and lodepng's
+temporary workspace use mmap-backed host allocations, so taking evidence does
+not perturb or exhaust the firmware heap being measured.
 
 ## Sources that needed the host treatment
 
-Seven files. Each is patched into the build directory at configure time — the
-originals are never touched, and each patch fails loudly if the source drifts
-out from under it.
+Host-incompatible sources are staged or patched into the build directory as
+tracked build outputs. The originals are never touched, and every patch checks
+its expected input and fails loudly if the source drifts underneath it.
 
 | Source | Why | Handled by |
 | --- | --- | --- |
@@ -584,8 +642,12 @@ out from under it.
 | `lib/anim_file/components/anim_file_seq.c` | Not portability — a firmware bug, see below. A looping single-frame animation reads past the end of its file once per tick. | `tools/patch_anim_file_seq.py` |
 | `lib/toolbox/dsp.c` | The convolution inner loop is Thumb-2 DSP assembly (`uxtb`, `smlabb`, `bfi`). | `tools/patch_dsp.py` |
 | `lvgl/src/libs/bin_decoder/lv_bin_decoder.c` | fbt rewrites it to claim the firmware's `.image` extension instead of `.bin`; unpatched, every icon fails to decode. | `tools/patch_bin_decoder.py` |
-| `FreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/port.c` | It compiles fine but deadlocks: the tick is a process-directed `SIGALRM`, so any thread can be handed it. See below. | `tools/patch_posix_port.py` |
-| `applications/services/web_server/web_server.c` | One line: it binds `http://0.0.0.0`, which mongoose reads as port 80 — privileged here, and single-instance. | `tools/patch_web_server.py` |
+| `lvgl/src/libs/lodepng/lodepng.c` | Normal LVGL decoding stays on furi allocation, but a thread-local scope routes simulator screenshot codec workspace to host virtual memory. | `tools/patch_lodepng_allocator.py` |
+| `FreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/port.c` | It compiles fine but deadlocks: the tick is a process-directed `SIGALRM`, so any thread can be handed it. Undersized device task stacks also make pthread silently choose its large default. See below. | `tools/patch_posix_port.py` |
+| `furi/core/memmgr.c` | It defines the firmware's `malloc`/`free`. ELF would export those from the executable and interpose them into SDL and libudev, so only this source is compiled with hidden visibility on Linux. Firmware calls still reach furi; shared libraries use libc. | source-specific option in `CMakeLists.txt` |
+| `furi/core/memmgr_heap.c` | Its target critical section is not mutual exclusion between POSIX task threads. The host copy uses a pthread mutex and masks the tick signal while held so a task cannot be preempted while owning the heap. | `tools/patch_memmgr_heap.py` |
+| `applications/services/web_server/web_server.c` | Its fixed port-80 listener is replaced by the validated runtime address and port, and the host-width URI length is passed to printf with the required `int` type. | `tools/patch_web_server.py` |
+| `applications/services/web_server/http_api/api_status.c` | Firmware format strings assume 32-bit `long`; LP64 hosts otherwise mis-serialize values such as negative battery current. | `tools/patch_api_status.py` |
 
 Two more substitutions are by design rather than necessity: `lvgl_addons/fs` is
 replaced by `src/lv_fs_host.c` because the original routes LVGL file access
@@ -648,35 +710,49 @@ additionally sleeps to absolute deadlines: upstream's plain `usleep(period)`
 makes the real period the period *plus* the cost of the tick, which measures
 1.25 ms for a 1 ms sleep here and ran the whole UI 30% slow.
 
+The same patch handles device-sized task stacks deliberately. When a requested
+buffer is smaller or less aligned than pthread accepts, the requested bytes
+remain charged to the furi heap, but pthread is given an explicit
+`PTHREAD_STACK_MIN` host stack. It no longer silently selects a multi-megabyte
+default stack for every such task.
+
 Measured after the fix: 36 runs of 300–400 frames across all four scenes, idle
 and under a saturated CPU, with no hang and no assert; simulated time tracks
 wall time at 1.00.
 
-The allocator is furi's own `memmgr_heap.c` running over a static 192 MB region
-handed to it by `shim/furi_hal_host.c`, not a FreeRTOS `heap_N.c`. furi
-overrides `malloc`, so heap_3 — which forwards to `malloc` — recurses until the
-stack dies.
+The allocator is furi's own `memmgr_heap.c`, not a FreeRTOS `heap_N.c`. It runs
+over a 16 MiB static region by default, configurable with
+`-DBUSYBAR_SIM_HEAP_MB=N` (minimum 8). The device has about 2.5 MiB total RAM;
+16 MiB accommodates the host's less compact asset representations while making
+leaks and unbounded growth visible. Simulator-only capture and recording
+buffers do not come from this region. `simctl.py status` reports current free
+space and the low-water mark. furi overrides `malloc`, so heap_3 — which
+forwards to `malloc` — would recurse until the stack dies. On Linux those
+allocator symbols are hidden from the executable's dynamic symbol table;
+otherwise SDL and libudev would accidentally allocate from the firmware heap
+before FreeRTOS even starts.
 
 ## Known gaps
 
 - Images are converted as ARGB8888 rather than the indexed formats fbt picks,
   to avoid a `pngquant` dependency. Icons with gradients therefore look
   smoother here than on the device, which quantises them.
-- `pthread_attr_setstack` warnings at startup are harmless. macOS wants
-  page-aligned stacks and furi's thread stacks are not, so the port falls back
-  to default-sized pthread stacks — more headroom than the device, not less.
-  It also means the simulator will not reproduce stack-overflow bugs.
+- Host and device ABIs use different amounts of stack. Device-sized task
+  buffers that pthread cannot use remain part of furi heap accounting, while
+  the running pthread gets an explicit `PTHREAD_STACK_MIN` stack. This is
+  bounded and deterministic, but the simulator still cannot faithfully
+  reproduce target stack-overflow boundaries.
 - Simulated time can lag the host clock. Each tick sleeps to an absolute
   deadline, so short overshoots are corrected on the next tick and the rate
   comes out right, but a backlog past `portTICK_RESYNC_THRESHOLD_MS` (250 ms,
   e.g. after the host suspends) is dropped rather than replayed as a burst.
 - Renaming the device over `/api/name` lasts until the process exits; there is
-  no settings partition to persist it to. The mDNS announcement carries the
-  name it had at startup and is not re-registered when it changes.
+  no host persistence for that setting yet. An opt-in mDNS announcement carries
+  the name it had at startup and is not re-registered when it changes.
 - The out-of-the-box flow is skipped. The startup app waits for a button and
   plays an animation off the recovery partition, which the simulator has no
   counterpart for, so it marks setup complete on first run
-  (`<assets_root>/data/done.txt`) and boots as an unboxed device.
+  (`<state_root>/data/done.txt`) and boots as an unboxed device.
 - `services_host.c` stubs are inert: autoupdates and low-power locks do
   nothing.
 - The mode selector is a lever with no detents here. Every position is

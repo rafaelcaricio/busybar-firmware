@@ -28,7 +28,6 @@
 
 #include <audio/audio.h>
 #include <ble/ble.h>
-#include <brightness_control/brightness_control.h>
 #include <device_name/device_name.h>
 #include <matter/matter.h>
 #include <mqtt/mqtt.h>
@@ -57,7 +56,6 @@
 static struct {
     int audio;
     int ble;
-    int brightness_control;
     int device_name;
     int matter;
     int mqtt;
@@ -71,9 +69,9 @@ static struct {
     FuriPubSub* matter_events;
     FuriPubSub* mqtt_events;
     FuriPubSub* power_events;
+    FuriMutex* power_mutex;
 
     FuriState* wifi_state;
-    FuriState* brightness_state;
     FuriState* updater_check_state;
     FuriState* updater_update_state;
     FuriState* updater_settings_state;
@@ -82,6 +80,8 @@ static struct {
     float volume;
     char device_name_value[DEVICE_NAME_MAX_SIZE];
     MqttConfig mqtt_config;
+    PowerInfo power_info;
+    bool usb_connected;
 } platform;
 
 void platform_services_host_init(void) {
@@ -91,24 +91,22 @@ void platform_services_host_init(void) {
     platform.matter_events = furi_pubsub_alloc();
     platform.mqtt_events = furi_pubsub_alloc();
     platform.power_events = furi_pubsub_alloc();
+    platform.power_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
 
     /* Item sizes match the real services, so a subscriber that reads the
      * published item sees a correctly sized zeroed struct. */
     platform.wifi_state = furi_state_alloc(sizeof(WifiInfo));
-    platform.brightness_state = furi_state_alloc(sizeof(BrightnessControlState));
     platform.updater_check_state = furi_state_alloc(sizeof(UpdaterCheckState));
     platform.updater_update_state = furi_state_alloc(sizeof(UpdaterUpdateState));
     platform.updater_settings_state = furi_state_alloc(sizeof(UpdaterSettings));
     platform.matter_switch_state = furi_state_alloc(sizeof(MatterSwitchState));
 
     const WifiInfo wifi_info = {0};
-    const BrightnessControlState brightness_state = {0};
     /* Not {0}: UpdaterCheckResultAvailable is the zero value, which would
      * claim an update is waiting and send the firmware settings app straight
      * into its update dialog. */
     const UpdaterCheckState updater_check_state = {.result = UpdaterCheckResultNone};
     furi_state_set(platform.wifi_state, &wifi_info);
-    furi_state_set(platform.brightness_state, &brightness_state);
     furi_state_set(platform.updater_check_state, &updater_check_state);
 
     const UpdaterUpdateState updater_update_state = {
@@ -128,10 +126,10 @@ void platform_services_host_init(void) {
 
     platform.volume = 0.5f;
     snprintf(platform.device_name_value, sizeof(platform.device_name_value), "BUSY Simulator");
+    platform_services_host_set_power(100, true, true);
 
     furi_record_create(RECORD_AUDIO, &platform.audio);
     furi_record_create(RECORD_BLE, &platform.ble);
-    furi_record_create(RECORD_BRIGHTNESS_CONTROL, &platform.brightness_control);
     furi_record_create(RECORD_DEVICE_NAME, &platform.device_name);
     furi_record_create(RECORD_MATTER, &platform.matter);
     furi_record_create(RECORD_MQTT, &platform.mqtt);
@@ -212,38 +210,6 @@ bool ble_stop(Ble* ble) {
 bool ble_forget(Ble* ble) {
     UNUSED(ble);
     return true;
-}
-
-/* --- brightness -------------------------------------------------------- */
-
-FuriState* brightness_control_get_state(const BrightnessControl* instance) {
-    UNUSED(instance);
-    return platform.brightness_state;
-}
-
-void brightness_control_set_auto_brightness(BrightnessControl* instance) {
-    UNUSED(instance);
-}
-
-void brightness_control_set_manual_brightness(BrightnessControl* instance, uint8_t brightness) {
-    UNUSED(instance);
-    UNUSED(brightness);
-}
-
-void brightness_control_set_brightness_override(
-    BrightnessControl* instance,
-    BrightnessControlModule module,
-    uint8_t override) {
-    UNUSED(instance);
-    UNUSED(module);
-    UNUSED(override);
-}
-
-void brightness_control_reset_brightness_override(
-    BrightnessControl* instance,
-    BrightnessControlModule module) {
-    UNUSED(instance);
-    UNUSED(module);
 }
 
 /* --- device name ------------------------------------------------------- */
@@ -430,9 +396,65 @@ void mqtt_unlink(Mqtt* instance) {
 
 /* --- power ------------------------------------------------------------- */
 
+void platform_services_host_set_power(uint8_t charge, bool usb_connected, bool charging) {
+    if(charge > 100) charge = 100;
+    if(!usb_connected) charging = false;
+
+    furi_check(furi_mutex_acquire(platform.power_mutex, FuriWaitForever) == FuriStatusOk);
+    const bool charge_changed = platform.power_info.charge != charge;
+    const bool usb_changed = platform.usb_connected != usb_connected;
+    const bool charging_changed = platform.power_info.is_charging != charging;
+
+    platform.usb_connected = usb_connected;
+    platform.power_info = (PowerInfo){
+        .is_charging = charging,
+        .is_full_charged = charge == 100,
+        .charge_enabled = usb_connected,
+        .charge = charge,
+        .current_battery = charging ? 500 : (usb_connected ? 0 : -250),
+        .current_usb = usb_connected ? 500 : 0,
+        .voltage_battery = 3300.0f + (float)charge * 9.0f,
+        .voltage_usb = usb_connected ? 5000.0f : 0.0f,
+        .temperature_charger = 25.0f,
+        .temperature_battery = 25.0f,
+        .charge_ilim_usb = 1500,
+        .charge_ilim_battery = 1500,
+        .charge_level_limit = 100,
+    };
+    furi_check(furi_mutex_release(platform.power_mutex) == FuriStatusOk);
+
+    if(charge_changed) {
+        PowerEvent event = {.type = PowerEventChargeAmountUpdate};
+        furi_pubsub_publish(platform.power_events, &event);
+    }
+    if(usb_changed) {
+        PowerEvent event = {.type = PowerEventUsbConnectionStateUpdate};
+        furi_pubsub_publish(platform.power_events, &event);
+    }
+    if(charging_changed) {
+        PowerEvent event = {.type = PowerEventChargingStateUpdate};
+        furi_pubsub_publish(platform.power_events, &event);
+    }
+}
+
+void platform_services_host_get_power(
+    uint8_t* charge,
+    bool* usb_connected,
+    bool* charging) {
+    furi_check(furi_mutex_acquire(platform.power_mutex, FuriWaitForever) == FuriStatusOk);
+    if(charge) *charge = platform.power_info.charge;
+    if(usb_connected) *usb_connected = platform.usb_connected;
+    if(charging) *charging = platform.power_info.is_charging;
+    furi_check(furi_mutex_release(platform.power_mutex) == FuriStatusOk);
+}
+
 void power_get_info(Power* power, PowerInfo* info) {
     UNUSED(power);
-    if(info) memset(info, 0, sizeof(*info));
+    if(!info) return;
+
+    furi_check(furi_mutex_acquire(platform.power_mutex, FuriWaitForever) == FuriStatusOk);
+    *info = platform.power_info;
+    furi_check(furi_mutex_release(platform.power_mutex) == FuriStatusOk);
 }
 
 FuriPubSub* power_get_pubsub(Power* power) {
@@ -446,8 +468,9 @@ float power_get_temperature_battery_celsius(float temperature_battery) {
 
 bool power_is_usb_connected(Power* power) {
     UNUSED(power);
-    /* The simulator is mains-powered by definition. */
-    return true;
+    bool connected;
+    platform_services_host_get_power(NULL, &connected, NULL);
+    return connected;
 }
 
 void power_reboot(Power* power, PowerRebootMode mode) {
@@ -477,15 +500,6 @@ void sysctl_set_debug_enabled(bool enabled) {
     FURI_LOG_I(TAG, "sysctl_set_debug_enabled(%d)", enabled);
 }
 
-/* --- time -------------------------------------------------------------- */
-
-bool time_set_settings(Time* instance, const TimeSettings* settings) {
-    UNUSED(instance);
-    UNUSED(settings);
-    /* The clock is the host's; timezone and format changes do not stick. */
-    return false;
-}
-
 /* --- updater ----------------------------------------------------------- */
 
 UpdaterStatus updater_check_for_update(Updater* instance) {
@@ -500,7 +514,10 @@ const char* updater_get_active_version(void) {
 
 UpdaterStatus updater_get_allowance_status(Updater* instance) {
     UNUSED(instance);
-    return UpdaterStatusOk;
+    uint8_t charge;
+    bool usb_connected;
+    platform_services_host_get_power(&charge, &usb_connected, NULL);
+    return (charge >= 40 || usb_connected) ? UpdaterStatusOk : UpdaterStatusBatteryLow;
 }
 
 void updater_get_check_info(Updater* instance, UpdateCheckInfo* info) {

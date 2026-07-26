@@ -169,6 +169,83 @@ END_REPLACEMENT = """    /* Stop the tick thread and ignore any pending SIGALRMs
 
 """
 
+TICK_INCREMENT = "    xTaskIncrementTick();"
+TICK_SWITCH = """    #if ( configUSE_PREEMPTION == 1 )
+        /* Select Next Task. */
+        vTaskSwitchContext();
+
+        pxThreadToResume = prvGetThreadFromTask( xTaskGetCurrentTaskHandle() );
+
+        prvSwitchThread( pxThreadToResume, pxThreadToSuspend );
+    #endif"""
+TICK_SWITCH_REPLACEMENT = """    #if ( configUSE_PREEMPTION == 1 )
+        /* Match current upstream: only enter the scheduler when the tick
+         * actually unblocked a higher-priority task or time slicing requests
+         * it. The vendored port switched unconditionally at 1 kHz, allowing a
+         * tick switch and a task yield to mutate pxCurrentTCB concurrently on
+         * their briefly-overlapping pthreads. */
+        if( xSwitchRequired != pdFALSE )
+        {
+            vTaskSwitchContext();
+
+            pxThreadToResume = prvGetThreadFromTask( xTaskGetCurrentTaskHandle() );
+
+            prvSwitchThread( pxThreadToResume, pxThreadToSuspend );
+        }
+    #else
+        ( void ) xSwitchRequired;
+    #endif"""
+
+STACK_FALLBACK = """    iRet = pthread_attr_setstack( &xThreadAttributes, pxEndOfStack, ulStackSize );
+    if( iRet != 0 )
+    {
+        fprintf( stderr, "[WARN] pthread_attr_setstack failed with return value: %d. Default stack will be used.\\n", iRet );
+        fprintf( stderr, "[WARN] Increase the stack size to PTHREAD_STACK_MIN.\\n" );
+    }"""
+
+STACK_FALLBACK_REPLACEMENT = """    iRet = pthread_attr_setstack( &xThreadAttributes, pxEndOfStack, ulStackSize );
+    if( iRet != 0 )
+    {
+        /* furi expresses task stacks in device-sized bytes, and many are
+         * smaller than a host pthread permits. Keep accounting the requested
+         * buffer in the furi heap, but ask pthread for the smallest legal
+         * host stack instead of silently accepting its multi-megabyte
+         * default. */
+        size_t xHostStackSize =
+            ulStackSize < ( size_t ) PTHREAD_STACK_MIN ?
+                ( size_t ) PTHREAD_STACK_MIN :
+                ulStackSize;
+        const long lHostPageSize = sysconf( _SC_PAGESIZE );
+
+        /* Darwin requires a page multiple, and on Apple Silicon that page can
+         * be larger than PTHREAD_STACK_MIN. Linux accepts the same rounding. */
+        if( lHostPageSize > 0 )
+        {
+            const size_t xRemainder = xHostStackSize % ( size_t ) lHostPageSize;
+            if( xRemainder != 0 )
+            {
+                xHostStackSize += ( size_t ) lHostPageSize - xRemainder;
+            }
+        }
+
+        iRet = pthread_attr_setstacksize( &xThreadAttributes, xHostStackSize );
+        if( iRet != 0 )
+        {
+            prvFatalError( "pthread_attr_setstacksize", iRet );
+        }
+    }"""
+
+THREAD_CREATE = """    iRet = pthread_create( &thread->pthread, &xThreadAttributes,
+                           prvWaitForStart, thread );
+
+    if( iRet != 0 )"""
+
+THREAD_CREATE_REPLACEMENT = """    iRet = pthread_create( &thread->pthread, &xThreadAttributes,
+                           prvWaitForStart, thread );
+    ( void ) pthread_attr_destroy( &xThreadAttributes );
+
+    if( iRet != 0 )"""
+
 
 def fail(path: Path, message: str) -> int:
     print(
@@ -217,10 +294,28 @@ def main() -> int:
 
     patched = patched[:end_start] + END_REPLACEMENT + patched[end_stop:]
 
+    if patched.count(TICK_INCREMENT) != 1 or patched.count(TICK_SWITCH) != 1:
+        return fail(args.input, "could not locate the vendored tick switch")
+    patched = patched.replace(
+        TICK_INCREMENT,
+        "    const BaseType_t xSwitchRequired = xTaskIncrementTick();",
+    )
+    patched = patched.replace(TICK_SWITCH, TICK_SWITCH_REPLACEMENT)
+
+    if patched.count(STACK_FALLBACK) != 1:
+        return fail(args.input, "could not locate the undersized pthread stack fallback")
+    patched = patched.replace(STACK_FALLBACK, STACK_FALLBACK_REPLACEMENT)
+
+    if patched.count(THREAD_CREATE) != 1:
+        return fail(args.input, "could not locate pthread_create")
+    patched = patched.replace(THREAD_CREATE, THREAD_CREATE_REPLACEMENT)
+
     # nanosleep() comes from the existing <time.h>; errno is used unguarded by
     # the original but never included there.
     if "errno.h" not in patched:
         patched = patched.replace("#include <time.h>", "#include <errno.h>\n#include <time.h>", 1)
+    if "unistd.h" not in patched:
+        patched = patched.replace("#include <time.h>", "#include <time.h>\n#include <unistd.h>", 1)
 
     # vPortEndScheduler declared the itimerval the removed code used.
     stale_declaration = "    struct itimerval itimer;\n"

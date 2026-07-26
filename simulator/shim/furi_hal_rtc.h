@@ -1,9 +1,9 @@
 /**
  * Host stand-in for the target furi_hal_rtc API.
  *
- * Backed by the workstation clock, so clock faces and countdowns in the
- * simulator show real local time. A set_datetime call is applied as an offset
- * rather than touching the system clock.
+ * Backed by the workstation clock in UTC, matching the device RTC. The time
+ * service applies the configured timezone for clock faces. A set_datetime
+ * call is applied as an offset rather than touching the system clock.
  */
 #pragma once
 

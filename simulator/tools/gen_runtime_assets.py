@@ -26,6 +26,7 @@ reconfiguring does not redo the whole tree.
 """
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,7 +42,12 @@ from LVGLImage import ColorFormat, LVGLImage  # noqa: E402
 COLOR_FORMAT = ColorFormat.ARGB8888
 
 
-def convert_sounds(source_dir: Path, target_dir: Path) -> tuple[int, int]:
+MANIFEST_NAME = ".simulator-generated-files"
+
+
+def convert_sounds(
+    source_dir: Path, target_dir: Path, expected: set[Path]
+) -> tuple[int, int]:
     """Convert .wav sources to the firmware's .snd, which the simulator plays.
 
     A .snd is headerless PCM: signed 16-bit little-endian, mono, 44100 Hz. See
@@ -60,6 +66,7 @@ def convert_sounds(source_dir: Path, target_dir: Path) -> tuple[int, int]:
 
     for source in sorted(source_dir.glob("*.wav")):
         target = target_dir / (source.stem + ".snd")
+        expected.add(target)
         if not is_stale(source, target):
             continue
 
@@ -84,7 +91,7 @@ def is_stale(source: Path, target: Path) -> bool:
     return not target.exists() or target.stat().st_mtime < source.stat().st_mtime
 
 
-def convert_images(source_dir: Path, target_dir: Path) -> int:
+def convert_images(source_dir: Path, target_dir: Path, expected: set[Path]) -> int:
     if not source_dir.is_dir():
         return 0
 
@@ -93,6 +100,7 @@ def convert_images(source_dir: Path, target_dir: Path) -> int:
 
     for png in sorted(source_dir.glob("*.png")):
         target = target_dir / f"{png.stem}.image"
+        expected.add(target)
         if not is_stale(png, target):
             continue
 
@@ -107,7 +115,9 @@ def convert_images(source_dir: Path, target_dir: Path) -> int:
     return converted
 
 
-def convert_animations(source_dir: Path, target_dir: Path) -> tuple[int, int]:
+def convert_animations(
+    source_dir: Path, target_dir: Path, expected: set[Path]
+) -> tuple[int, int]:
     if not source_dir.is_dir():
         return 0, 0
 
@@ -117,6 +127,7 @@ def convert_animations(source_dir: Path, target_dir: Path) -> tuple[int, int]:
 
     for archive in sorted(source_dir.glob("*.zip")):
         target = target_dir / f"{archive.stem}.anim"
+        expected.add(target)
         if not is_stale(archive, target):
             continue
 
@@ -136,7 +147,26 @@ def convert_animations(source_dir: Path, target_dir: Path) -> tuple[int, int]:
     return converted, failed
 
 
-def copy_app_resources(root: Path) -> int:
+def copy_tree(source_dir: Path, target_dir: Path, expected: set[Path]) -> int:
+    """Copy a tree without symlinking the build back into the source checkout."""
+    if not source_dir.is_dir():
+        return 0
+
+    copied = 0
+    for source in sorted(path for path in source_dir.rglob("*") if path.is_file()):
+        target = target_dir / source.relative_to(source_dir)
+        expected.add(target)
+        if not is_stale(source, target):
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        copied += 1
+
+    return copied
+
+
+def copy_app_resources(root: Path, expected: set[Path]) -> int:
     """Install every applications/*/resources tree, which ships as it is.
 
     These are files an app reads at runtime but that no converter produces —
@@ -151,14 +181,56 @@ def copy_app_resources(root: Path) -> int:
     for resources in sorted(REPO_ROOT.glob("applications/*/*/resources")):
         for source in sorted(p for p in resources.rglob("*") if p.is_file()):
             target = ext / source.relative_to(resources)
+            expected.add(target)
             if not is_stale(source, target):
                 continue
 
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(source.read_bytes())
+            shutil.copy2(source, target)
             copied += 1
 
     return copied
+
+
+def prepare_output_root(root: Path) -> None:
+    manifest = root / MANIFEST_NAME
+    if manifest.exists():
+        return
+
+    # Older simulator builds did not track their outputs and linked the fonts
+    # directory back into the checkout. Recreate only the generated /ext tree;
+    # shutil removes directory symlinks instead of following them, so this
+    # cannot modify the source asset directory.
+    ext = root / "ext"
+    if ext.exists() or ext.is_symlink():
+        if ext.is_symlink():
+            ext.unlink()
+        else:
+            shutil.rmtree(ext)
+
+
+def remove_stale_outputs(root: Path, expected: set[Path]) -> None:
+    manifest = root / MANIFEST_NAME
+    if not manifest.exists():
+        return
+
+    for line in manifest.read_text().splitlines():
+        relative = Path(line)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe path in {manifest}: {line}")
+
+        target = root / relative
+        if target in expected:
+            continue
+        if target.is_file() or target.is_symlink():
+            target.unlink()
+
+
+def write_manifest(root: Path, expected: set[Path]) -> None:
+    manifest = root / MANIFEST_NAME
+    text = "".join(f"{path.relative_to(root)}\n" for path in sorted(expected))
+    if not manifest.exists() or manifest.read_text() != text:
+        manifest.write_text(text)
 
 
 def main() -> int:
@@ -166,54 +238,73 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True, help="Asset root to populate")
     args = parser.parse_args()
 
+    args.root.mkdir(parents=True, exist_ok=True)
+    expected: set[Path] = set()
+    prepare_output_root(args.root)
+
     apps_assets = args.root / "ext" / "apps_assets"
     apps_assets.mkdir(parents=True, exist_ok=True)
 
     shared = apps_assets / "shared"
     shared.mkdir(parents=True, exist_ok=True)
 
-    # Fonts ship in their final form; link rather than copy.
-    fonts_link = shared / "fonts"
-    if not fonts_link.exists():
-        fonts_link.symlink_to(REPO_ROOT / "assets" / "shared" / "fonts")
+    # Fonts ship in their final form. Copy them so storage operations against a
+    # simulator build can never traverse a symlink into the source checkout.
+    fonts = copy_tree(
+        REPO_ROOT / "assets" / "shared" / "fonts", shared / "fonts", expected
+    )
 
     images = convert_images(REPO_ROOT / "assets" / "shared" / "images" / "external",
-                            shared / "images")
+                            shared / "images", expected)
 
     app_images = 0
     app_root = REPO_ROOT / "assets" / "images" / "external"
     if app_root.is_dir():
         for app_dir in sorted(p for p in app_root.iterdir() if p.is_dir()):
-            app_images += convert_images(app_dir, apps_assets / app_dir.name / "images")
+            app_images += convert_images(
+                app_dir, apps_assets / app_dir.name / "images", expected
+            )
 
     anims, anim_failures = convert_animations(
-        REPO_ROOT / "assets" / "shared" / "animations", shared / "animations")
+        REPO_ROOT / "assets" / "shared" / "animations",
+        shared / "animations",
+        expected,
+    )
 
     anim_root = REPO_ROOT / "assets" / "animations"
     if anim_root.is_dir():
         for app_dir in sorted(p for p in anim_root.iterdir() if p.is_dir()):
             converted, failures = convert_animations(
-                app_dir, apps_assets / app_dir.name / "animations")
+                app_dir, apps_assets / app_dir.name / "animations", expected
+            )
             anims += converted
             anim_failures += failures
 
     sounds, sound_failures = convert_sounds(
-        REPO_ROOT / "assets" / "shared" / "sounds", shared / "sounds")
+        REPO_ROOT / "assets" / "shared" / "sounds", shared / "sounds", expected
+    )
 
     sound_root = REPO_ROOT / "assets" / "sounds"
     if sound_root.is_dir():
         for app_dir in sorted(p for p in sound_root.iterdir() if p.is_dir()):
             converted, failures = convert_sounds(
-                app_dir, apps_assets / app_dir.name / "sounds")
+                app_dir, apps_assets / app_dir.name / "sounds", expected
+            )
             sounds += converted
             sound_failures += failures
 
     anim_failures += sound_failures
 
-    resources = copy_app_resources(args.root)
+    resources = copy_app_resources(args.root, expected)
 
-    print(f"assets: {images} shared images, {app_images} app images, {anims} animations, "
-          f"{sounds} sounds, {resources} app resources"
+    if anim_failures:
+        return 1
+
+    remove_stale_outputs(args.root, expected)
+    write_manifest(args.root, expected)
+
+    print(f"assets: {fonts} fonts, {images} shared images, {app_images} app images, "
+          f"{anims} animations, {sounds} sounds, {resources} app resources"
           + (f", {anim_failures} conversion failures" if anim_failures else ""))
     return 0
 

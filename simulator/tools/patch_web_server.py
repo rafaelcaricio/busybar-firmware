@@ -30,6 +30,11 @@ DECLARATION = """
 const char* web_srv_host_listen_url(void);
 """
 
+URI_FORMAT = 'furi_string_alloc_printf("%.*s", msg->uri.len, msg->uri.buf)'
+URI_FORMAT_REPLACEMENT = (
+    'furi_string_alloc_printf("%.*s", (int)msg->uri.len, msg->uri.buf)'
+)
+
 
 def fail(message: str) -> int:
     print(f"{message}; update simulator/tools/patch_web_server.py", file=sys.stderr)
@@ -48,9 +53,14 @@ def main() -> int:
         return fail(f"{args.input}: expected exactly one mg_http_listen on 0.0.0.0")
     if source.count(ENTRY) != 1:
         return fail(f"{args.input}: could not locate web_srv_start")
+    if source.count(URI_FORMAT) != 2:
+        return fail(f"{args.input}: expected two URI formatting calls")
 
     patched = source.replace(LISTEN, LISTEN_REPLACEMENT)
     patched = patched.replace(ENTRY, DECLARATION + ENTRY)
+    # printf's dynamic precision argument is int, while mongoose stores the
+    # URI length as size_t on a 64-bit host.
+    patched = patched.replace(URI_FORMAT, URI_FORMAT_REPLACEMENT)
 
     if '"http://0.0.0.0"' in patched:
         return fail(f"{args.input}: the hardcoded listen address survived patching")

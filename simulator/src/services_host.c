@@ -23,6 +23,7 @@
 #include <furi_hal.h>
 
 #include <time/time.h>
+#include <time/settings/settings_i.h>
 #include <updater/updater.h>
 #include <low_power/low_power.h>
 #include <power/power_service/power.h>
@@ -38,13 +39,20 @@ static int low_power_instance;
  * they change. Nothing changes them here, but a subscriber still has to be
  * handed a real object holding the same values time_get_settings() reports. */
 static FuriState* time_settings_state;
+static FuriMutex* time_settings_mutex;
+static TimeSettings time_settings;
 
 static void services_host_time_settings_init(void) {
+    time_settings_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     time_settings_state = furi_state_alloc(sizeof(TimeSettings));
 
-    TimeSettings settings;
-    time_get_settings((Time*)&time_instance, &settings);
-    furi_state_set(time_settings_state, &settings);
+    if(!time_settings_load(&time_settings) && !time_settings_reset(&time_settings)) {
+        FURI_LOG_W(TAG, "could not load or reset time settings; using UTC/24h");
+        memset(&time_settings, 0, sizeof(time_settings));
+        time_settings.time_format = TimeSettingTimeFormat24h;
+        time_settings.timezone = utz_zone_default;
+    }
+    furi_state_set(time_settings_state, &time_settings);
 }
 
 void services_host_init(void) {
@@ -61,11 +69,22 @@ void time_get_settings(const Time* instance, TimeSettings* settings) {
     UNUSED(instance);
     furi_check(settings);
 
-    memset(settings, 0, sizeof(*settings));
-    settings->time_format = TimeSettingTimeFormat24h;
-    /* The timezone carries the abbreviation format string that the settings
-     * menu passes straight to snprintf(); a zeroed one is a NULL format. */
-    settings->timezone = utz_zone_default;
+    furi_check(furi_mutex_acquire(time_settings_mutex, FuriWaitForever) == FuriStatusOk);
+    *settings = time_settings;
+    furi_check(furi_mutex_release(time_settings_mutex) == FuriStatusOk);
+}
+
+bool time_set_settings(Time* instance, const TimeSettings* settings) {
+    UNUSED(instance);
+    furi_check(settings);
+
+    if(!time_settings_save(settings)) return false;
+
+    furi_check(furi_mutex_acquire(time_settings_mutex, FuriWaitForever) == FuriStatusOk);
+    time_settings = *settings;
+    furi_check(furi_mutex_release(time_settings_mutex) == FuriStatusOk);
+    furi_state_set(time_settings_state, settings);
+    return true;
 }
 
 FuriState* time_get_settings_state(Time* instance) {
@@ -74,23 +93,27 @@ FuriState* time_get_settings_state(Time* instance) {
 }
 
 time_t time_get_timestamp_ms(void) {
-    struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
+    return furi_hal_rtc_get_timestamp_ms();
+}
 
-    return (time_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+time_t time_get_timestamp(void) {
+    return furi_hal_rtc_get_timestamp();
 }
 
 LocalTime time_get_local_time(Time* instance) {
     UNUSED(instance);
 
-    /* furi_hal_rtc already reports workstation local time in the simulator,
-     * so the offset here is zero rather than a real timezone shift. */
-    const LocalTime local = {
-        .dt = furi_hal_rtc_get_datetime().dt,
-        .offset = {0},
-    };
+    TimeSettings settings;
+    time_get_settings(instance, &settings);
 
-    return local;
+    DateTimeMs utc = furi_hal_rtc_get_datetime();
+    utz_offset_t offset;
+    utz_get_current_offset(&settings.timezone, &utc.dt, &offset);
+
+    return (LocalTime){
+        .dt = utz_udatetime_add(&utc.dt, &offset),
+        .offset = offset,
+    };
 }
 
 /* -- updater ------------------------------------------------------------ */

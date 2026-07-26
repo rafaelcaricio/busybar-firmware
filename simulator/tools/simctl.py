@@ -2,16 +2,17 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""Drive a running simulator: press buttons, take screenshots, record a GIF.
+"""Build, diagnose and drive the BusyBar simulator.
 
-The simulator can be walked from a shell — the firmware's own HTTP API takes
-button presses, and SIGUSR2 makes the window capture itself — but doing that by
-hand has sharp edges. This wraps them:
+The simulator can be walked from a shell through the firmware's own HTTP API,
+but doing that by hand has sharp edges. This wraps them:
 
-  * Waiting for the API to come up, rather than sleeping and hoping.
-  * Waiting for a capture to finish. An encode takes a couple of seconds, so a
-    naive `ls` right after the signal finds nothing, or finds a half-written
-    file.
+  * Configuring, building and running the smoke regression with one command.
+  * Probing the exact CMake configuration in a temporary directory when host
+    dependencies or submodules are suspect.
+  * Waiting for both the HTTP API and rendered displays to become ready.
+  * Waiting for exact presented-frame boundaries and coherent screenshots,
+    rather than sleeping and hoping.
   * The key names. `/api/input` speaks the device's names, where `up` is a
     direction of dial rotation and moves the highlight *down* the list. That is
     the device's contract and this does not change it, but it also accepts
@@ -20,9 +21,12 @@ hand has sharp edges. This wraps them:
     raw frames, then hands them to ffmpeg for the GIF — the one part that is
     not stdlib, and the only thing here that needs a tool on PATH.
 
-Everything else is stdlib: this has to run anywhere the simulator builds.
+Everything except GIF encoding is stdlib: this has to run anywhere the
+simulator builds.
 
-    simctl.py start --scene busy
+    simctl.py doctor
+    simctl.py build --test
+    simctl.py start --scene busy --port 0
     simctl.py press next ok
     simctl.py shot setup
     simctl.py run next ok shot:theme next shot:second-theme
@@ -36,12 +40,14 @@ build directory, so later commands need no arguments.
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -70,6 +76,8 @@ KEY_ALIASES = {
 CAPTURE_TIMEOUT = 30.0
 START_TIMEOUT = 60.0
 CONTROL_TIMEOUT = 90.0
+FRAME_SECONDS = 0.016
+CAPTURE_KINDS = ("front-raw", "back-raw", "front", "back", "window")
 
 # Recording defaults. Twelve frames a second is enough for the wipes and the
 # scrolling labels, and every one of them is a whole window read back off the
@@ -90,16 +98,49 @@ def session_path(build: Path) -> Path:
     return build / "simctl-session.json"
 
 
-def read_session(build: Path) -> dict:
+def load_session(build: Path) -> dict:
     path = session_path(build)
     if not path.is_file():
         raise SimctlError(f"no session; run `simctl.py start` first ({path} is missing)")
 
-    session = json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as error:
+        raise SimctlError(f"cannot read session metadata from {path}: {error}")
 
+
+def process_matches(session: dict) -> bool:
     try:
         os.kill(session["pid"], 0)
-    except (OSError, ProcessLookupError):
+    except (OSError, ProcessLookupError, KeyError):
+        return False
+
+    expected = session.get("binary")
+    if not expected:
+        return True
+
+    proc_executable = Path(f"/proc/{session['pid']}/exe")
+    if proc_executable.exists():
+        try:
+            return proc_executable.resolve() == Path(expected).resolve()
+        except OSError:
+            return False
+
+    result = subprocess.run(
+        ["ps", "-p", str(session["pid"]), "-o", "command="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    command = result.stdout.strip()
+    return command == expected or command.startswith(expected + " ")
+
+
+def read_session(build: Path) -> dict:
+    session = load_session(build)
+    if not process_matches(session):
         raise SimctlError(f"the simulator (pid {session['pid']}) is gone; start it again")
 
     return session
@@ -109,7 +150,41 @@ def write_session(build: Path, session: dict) -> None:
     session_path(build).write_text(json.dumps(session, indent=2) + "\n")
 
 
+def cleanup_session(build: Path, session: dict) -> None:
+    """Remove only tool-owned transient artifacts named by session metadata."""
+    control_path = session.get("control")
+    if control_path:
+        candidate = Path(control_path)
+        try:
+            if (
+                candidate.name.startswith("simctl-control")
+                and candidate.parent.resolve() == build.resolve()
+            ):
+                candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    state_value = session.get("state")
+    if session.get("ephemeral_state") and state_value:
+        candidate = Path(state_value).resolve()
+        temporary_root = Path(tempfile.gettempdir()).resolve()
+        if (
+            candidate.name.startswith("busybar-sim-state-")
+            and candidate.is_relative_to(temporary_root)
+        ):
+            shutil.rmtree(candidate, ignore_errors=True)
+
+    session_path(build).unlink(missing_ok=True)
+
+
 # -- talking to the simulator ----------------------------------------------
+
+
+def reserve_port() -> int:
+    """Choose an available loopback port for `start --port 0`."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
 
 
 def api(session: dict, path: str, method: str = "GET", timeout: float = 5.0) -> str:
@@ -170,6 +245,56 @@ def control(session: dict, request: str, timeout: float = CONTROL_TIMEOUT) -> li
     return words[1:]
 
 
+def renderer_status(session: dict, timeout: float = 5.0) -> dict:
+    words = control(session, "status", timeout=timeout)
+    if len(words) != 8:
+        raise SimctlError(f"malformed renderer status: {' '.join(words)!r}")
+
+    frames, front_updates, back_updates, width, height, quitting, heap_free, heap_min = (
+        int(value) for value in words
+    )
+    return {
+        "frames": frames,
+        "front_updates": front_updates,
+        "back_updates": back_updates,
+        "width": width,
+        "height": height,
+        "quitting": bool(quitting),
+        "heap_free": heap_free,
+        "heap_min": heap_min,
+    }
+
+
+def wait_frames(session: dict, count: int, timeout: float | None = None) -> int:
+    if count < 0:
+        raise SimctlError("frame count must not be negative")
+    if count == 0:
+        return renderer_status(session)["frames"]
+
+    status = renderer_status(session)
+    target = status["frames"] + count
+    if timeout is None:
+        timeout = max(5.0, count * FRAME_SECONDS * 4)
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 600:
+        raise SimctlError("frame wait timeout must be between 0 and 600 seconds")
+
+    timeout_ms = max(1, min(600_000, math.ceil(timeout * 1000)))
+    words = control(
+        session,
+        f"wait frame {target} {timeout_ms}",
+        timeout=timeout + 1,
+    )
+    if len(words) != 1:
+        raise SimctlError(f"malformed frame-wait reply: {' '.join(words)!r}")
+    return int(words[0])
+
+
+def wait_seconds(session: dict, seconds: float) -> int:
+    if not math.isfinite(seconds) or seconds < 0:
+        raise SimctlError("wait duration must be a finite, non-negative number")
+    return wait_frames(session, math.ceil(seconds / FRAME_SECONDS))
+
+
 def resolve_key(name: str) -> str:
     key = KEY_ALIASES.get(name, name)
     if key not in DEVICE_KEYS:
@@ -182,10 +307,125 @@ def resolve_key(name: str) -> str:
 # -- commands --------------------------------------------------------------
 
 
+def run_checked(command: list[str], purpose: str) -> None:
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise SimctlError(f"{purpose} failed with exit code {result.returncode}")
+
+
+def cmake_generator(requested: str | None, build: Path | None = None) -> list[str]:
+    if requested:
+        return ["-G", requested]
+    if build is not None and (build / "CMakeCache.txt").is_file():
+        return []
+    if shutil.which("ninja"):
+        return ["-G", "Ninja"]
+    return []
+
+
+def command_doctor(args) -> int:
+    """Exercise the real configure path without leaving a build behind."""
+    tools = {
+        "cmake": shutil.which("cmake"),
+        "uv": shutil.which("uv"),
+        "ninja": shutil.which("ninja"),
+        "ffmpeg": shutil.which("ffmpeg"),
+    }
+    roles = {
+        "cmake": "required",
+        "uv": "required",
+        "ninja": "preferred",
+        "ffmpeg": "optional; GIF recording",
+    }
+    for name, path in tools.items():
+        print(f"{name:<7} {path or 'missing'} ({roles[name]})")
+
+    if not tools["cmake"] or not tools["uv"]:
+        raise SimctlError("cmake and uv are required")
+
+    with tempfile.TemporaryDirectory(prefix="busybar-sim-doctor-") as temporary:
+        probe = Path(temporary)
+        command = [
+            tools["cmake"],
+            "-S",
+            str(SIMULATOR_DIR),
+            "-B",
+            str(probe),
+            *cmake_generator(args.generator),
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DBUILD_TESTING=ON",
+        ]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            output = (result.stdout + result.stderr).strip()
+            if output:
+                print(output, file=sys.stderr)
+            raise SimctlError("the simulator CMake dependency probe failed")
+
+    print("configure probe passed: compiler, SDL2, host networking and submodules are ready")
+    return 0
+
+
+def command_build(args) -> int:
+    """Configure and build the simulator, optionally running its smoke test."""
+    cmake = shutil.which("cmake")
+    if not cmake:
+        raise SimctlError("cmake is not on PATH")
+    if args.heap_mb < 8:
+        raise SimctlError("--heap-mb must be at least 8")
+    if args.jobs is not None and args.jobs < 1:
+        raise SimctlError("--jobs must be at least 1")
+
+    build = args.build.resolve()
+    build.mkdir(parents=True, exist_ok=True)
+    configure = [
+        cmake,
+        "-S",
+        str(SIMULATOR_DIR),
+        "-B",
+        str(build),
+        *cmake_generator(args.generator, build),
+        f"-DCMAKE_BUILD_TYPE={args.build_type}",
+        f"-DBUSYBAR_SIM_HEAP_MB={args.heap_mb}",
+        f"-DBUILD_TESTING={'ON' if args.test else 'OFF'}",
+    ]
+    run_checked(configure, "CMake configure")
+
+    build_command = [cmake, "--build", str(build), "--parallel"]
+    if args.jobs:
+        build_command.append(str(args.jobs))
+    run_checked(build_command, "simulator build")
+
+    if args.test:
+        ctest = shutil.which("ctest")
+        if not ctest:
+            raise SimctlError("ctest is not on PATH")
+        run_checked(
+            [ctest, "--test-dir", str(build), "--output-on-failure"],
+            "simulator smoke test",
+        )
+
+    print(f"simulator ready: {build / 'busybar-sim'}")
+    return 0
+
+
 def command_start(args) -> int:
-    binary = args.build / "busybar-sim"
+    binary = (args.build / "busybar-sim").resolve()
     if not binary.is_file():
         raise SimctlError(f"{binary} is missing; build the simulator first")
+    if args.port < 0 or args.port > 65535:
+        raise SimctlError("--port must be between 0 and 65535")
+    if args.port == 0:
+        args.port = reserve_port()
+
+    if session_path(args.build).is_file():
+        existing = load_session(args.build)
+        if process_matches(existing):
+            raise SimctlError(
+                f"a simulator session is already running as pid {existing['pid']}; "
+                "stop it before starting another"
+            )
+        cleanup_session(args.build, existing)
 
     if api_is_up(args.port):
         raise SimctlError(
@@ -199,6 +439,14 @@ def command_start(args) -> int:
     log_path = shots / "sim.log"
     log = log_path.open("wb")
 
+    if args.state_dir:
+        state_dir = args.state_dir.resolve()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        ephemeral_state = False
+    else:
+        state_dir = Path(tempfile.mkdtemp(prefix="busybar-sim-state-")).resolve()
+        ephemeral_state = True
+
     # Beside the session file rather than in the capture directory: it belongs
     # to this simulator, and a unix socket path is short enough to run out of.
     control_path = args.build.resolve() / "simctl-control.sock"
@@ -211,39 +459,102 @@ def command_start(args) -> int:
         str(args.port),
         "--control",
         str(control_path),
+        "--state-dir",
+        str(state_dir),
     ]
     if args.scene:
         command += ["--scene", args.scene]
     command += args.extra
 
-    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
-
-    deadline = time.monotonic() + START_TIMEOUT
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise SimctlError(
-                f"the simulator exited with {process.returncode}; see {log_path}"
-            )
-        if api_is_up(args.port):
-            break
-        time.sleep(0.2)
-    else:
-        process.terminate()
-        raise SimctlError(f"the API never came up; see {log_path}")
-
-    write_session(
-        args.build,
-        {
-            "pid": process.pid,
-            "port": args.port,
-            "shots": str(shots),
-            "log": str(log_path),
-            "scene": args.scene,
-            "control": str(control_path),
-        },
+    process = subprocess.Popen(
+        command,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
 
-    print(f"simulator up: pid {process.pid}, port {args.port}, captures in {shots}")
+    session = {
+        "pid": process.pid,
+        "binary": str(binary),
+        "port": args.port,
+        "shots": str(shots),
+        "log": str(log_path),
+        "scene": args.scene,
+        "control": str(control_path),
+        "state": str(state_dir),
+        "ephemeral_state": ephemeral_state,
+    }
+
+    try:
+        deadline = time.monotonic() + START_TIMEOUT
+        api_ready = False
+        render_status = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise SimctlError(
+                    f"the simulator exited with {process.returncode}; see {log_path}"
+                )
+
+            if not api_ready:
+                api_ready = api_is_up(args.port)
+
+            try:
+                candidate = renderer_status(session, timeout=1)
+                if (
+                    candidate["front_updates"] > 0
+                    and candidate["back_updates"] > 0
+                    and candidate["width"] > 0
+                    and candidate["height"] > 0
+                    and not candidate["quitting"]
+                ):
+                    render_status = candidate
+            except SimctlError:
+                pass
+
+            if api_ready and render_status:
+                break
+            time.sleep(0.05)
+        else:
+            missing = []
+            if not api_ready:
+                missing.append("HTTP API")
+            if not render_status:
+                missing.append("rendered displays")
+            raise SimctlError(f"{' and '.join(missing)} never became ready; see {log_path}")
+
+        # A status request can observe a framebuffer submission during the
+        # render that uploads it. Two subsequent presents establish a stable
+        # handoff without an arbitrary startup sleep.
+        target = render_status["frames"] + 2
+        remaining = max(1.0, deadline - time.monotonic())
+        control(
+            session,
+            f"wait frame {target} {min(600_000, math.ceil(remaining * 1000))}",
+            timeout=remaining + 1,
+        )
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        log.close()
+        control_path.unlink(missing_ok=True)
+        if ephemeral_state:
+            shutil.rmtree(state_dir, ignore_errors=True)
+        raise
+    finally:
+        if not log.closed:
+            log.close()
+
+    write_session(args.build, session)
+
+    print(
+        f"simulator up: pid {process.pid}, port {args.port}, "
+        f"captures in {shots}, state in {state_dir}"
+    )
     return 0
 
 
@@ -256,7 +567,7 @@ def press(session: dict, name: str, settle: float) -> None:
     else:
         print(f"press {key}")
 
-    time.sleep(settle)
+    wait_seconds(session, settle)
 
 
 def command_press(args) -> int:
@@ -269,47 +580,51 @@ def command_press(args) -> int:
 
 
 def shot(session: dict, label: str | None) -> list[Path]:
-    """Capture, and wait for the encoder to finish rather than for a guess.
+    """Capture one coherent rendered frame and wait for all five PNGs."""
+    if label and (
+        label in (".", "..")
+        or any(
+            character
+            not in "-_.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            for character in label
+        )
+    ):
+        raise SimctlError("capture labels may contain only letters, digits, '.', '_' and '-'")
 
-    The simulator logs one line naming the window file once all three images
-    are written, so that line is the completion signal.
-    """
-    log_path = Path(session["log"])
-    start = log_path.stat().st_size if log_path.is_file() else 0
+    shots = Path(session["shots"])
+    if label:
+        existing = [
+            shots / f"{label}-{name}.png"
+            for name in CAPTURE_KINDS
+            if (shots / f"{label}-{name}.png").exists()
+        ]
+        if existing:
+            raise SimctlError(f"capture label {label!r} already exists at {existing[0]}")
 
-    os.kill(session["pid"], signal.SIGUSR2)
+    reply = control(
+        session,
+        f"screenshot {shots}",
+        timeout=CAPTURE_TIMEOUT,
+    )
+    if len(reply) != 2:
+        raise SimctlError(f"malformed screenshot reply: {' '.join(reply)!r}")
 
-    deadline = time.monotonic() + CAPTURE_TIMEOUT
-    written = None
-
-    while time.monotonic() < deadline:
-        with log_path.open() as log:
-            log.seek(start)
-            for line in log:
-                if "[sim] wrote " in line:
-                    written = line.split("[sim] wrote ", 1)[1].split(" and ")[0].strip()
-                    break
-
-        if written:
-            break
-        time.sleep(0.1)
-
-    if not written:
-        raise SimctlError(f"the capture did not finish within {CAPTURE_TIMEOUT:.0f}s")
-
-    window = Path(written)
-    # window-007.png -> the -007 the other two share.
-    sequence = window.stem.split("-")[-1]
+    sequence = int(reply[0])
+    captured_frame = int(reply[1])
+    suffix = f"{sequence:03d}"
     captured = []
 
-    for name in ("front", "back", "window"):
-        source = window.with_name(f"{name}-{sequence}.png")
+    for name in CAPTURE_KINDS:
+        source = shots / f"{name}-{suffix}.png"
+        if not source.is_file():
+            raise SimctlError(f"simulator reported a capture, but {source} is missing")
         if label:
-            target = window.with_name(f"{label}-{name}.png")
+            target = shots / f"{label}-{name}.png"
             source.replace(target)
             source = target
         captured.append(source)
 
+    print(f"captured rendered frame {captured_frame}", file=sys.stderr)
     print("\n".join(str(path) for path in captured))
     return captured
 
@@ -320,14 +635,29 @@ def command_shot(args) -> int:
 
 
 def walk(session: dict, steps: list[str], settle: float) -> None:
-    """Play a walkthrough: keys, `shot`, `shot:label` and `wait:1.5`."""
+    """Play keys, shots, frame waits and duration waits."""
     for step in steps:
         if step == "shot":
             shot(session, None)
         elif step.startswith("shot:"):
-            shot(session, step.split(":", 1)[1])
+            label = step.split(":", 1)[1]
+            if not label:
+                raise SimctlError("shot: requires a label")
+            shot(session, label)
+        elif step.startswith("frames:"):
+            value = step.split(":", 1)[1]
+            try:
+                frames = int(value)
+            except ValueError:
+                raise SimctlError(f"invalid frame count {value!r}")
+            wait_frames(session, frames)
         elif step.startswith("wait:"):
-            time.sleep(float(step.split(":", 1)[1]))
+            value = step.split(":", 1)[1]
+            try:
+                seconds = float(value)
+            except ValueError:
+                raise SimctlError(f"invalid wait duration {value!r}")
+            wait_seconds(session, seconds)
         else:
             press(session, step, settle)
 
@@ -442,12 +772,26 @@ def command_record(args) -> int:
 
 def command_status(args) -> int:
     session = read_session(args.build)
+    render = renderer_status(session)
 
     print(f"pid {session['pid']}, port {session['port']}")
+    print(
+        f"render   frame {render['frames']}, "
+        f"front {render['front_updates']} updates, "
+        f"back {render['back_updates']} updates, "
+        f"{render['width']}x{render['height']}"
+    )
+    print(
+        f"heap     {render['heap_free'] / 1024 / 1024:.1f} MiB free, "
+        f"{render['heap_min'] / 1024 / 1024:.1f} MiB low-water"
+    )
     print(f"captures {session['shots']}")
     print(f"log      {session['log']}")
     if session.get("control"):
         print(f"control  {session['control']}")
+    if session.get("state"):
+        kind = "temporary" if session.get("ephemeral_state") else "persistent"
+        print(f"state    {session['state']} ({kind})")
 
     status = json.loads(api(session, "/api/status"))
     firmware = status.get("firmware", {})
@@ -458,8 +802,43 @@ def command_status(args) -> int:
     return 0
 
 
-def command_log(args) -> int:
+def command_power(args) -> int:
     session = read_session(args.build)
+    current = control(session, "power")
+    if len(current) != 3:
+        raise SimctlError(f"malformed power status: {' '.join(current)!r}")
+
+    charge, usb, charging = (int(value) for value in current)
+    if args.charge is not None:
+        if args.charge < 0 or args.charge > 100:
+            raise SimctlError("--charge must be between 0 and 100")
+        charge = args.charge
+    if args.usb is not None:
+        usb = int(args.usb == "connected")
+        if not usb and args.charging is None:
+            charging = 0
+    if args.charging is not None:
+        charging = int(args.charging == "yes")
+    if charging and not usb:
+        raise SimctlError("the simulated battery cannot charge while USB is disconnected")
+
+    if args.charge is not None or args.usb is not None or args.charging is not None:
+        current = control(session, f"power {charge} {usb} {charging}")
+        if len(current) != 3:
+            raise SimctlError(f"malformed power update: {' '.join(current)!r}")
+        charge, usb, charging = (int(value) for value in current)
+
+    print(
+        f"battery {charge}%, USB {'connected' if usb else 'disconnected'}, "
+        f"{'charging' if charging else 'not charging'}"
+    )
+    return 0
+
+
+def command_log(args) -> int:
+    # Logs are most valuable after a crash, so unlike interactive commands this
+    # deliberately accepts a session whose process has already exited.
+    session = load_session(args.build)
     lines = Path(session["log"]).read_text(errors="replace").splitlines()
 
     for line in lines[-args.lines :]:
@@ -469,19 +848,26 @@ def command_log(args) -> int:
 
 
 def command_stop(args) -> int:
-    path = session_path(args.build)
-    if not path.is_file():
+    if not session_path(args.build).is_file():
         print("no session")
         return 0
 
-    session = json.loads(path.read_text())
-    try:
-        os.kill(session["pid"], signal.SIGTERM)
+    session = load_session(args.build)
+    if process_matches(session):
+        try:
+            control(session, "quit", timeout=2)
+        except SimctlError:
+            os.kill(session["pid"], signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while process_matches(session) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if process_matches(session):
+            os.kill(session["pid"], signal.SIGKILL)
         print(f"stopped pid {session['pid']}")
-    except (OSError, ProcessLookupError):
+    else:
         print(f"pid {session['pid']} was already gone")
 
-    path.unlink()
+    cleanup_session(args.build, session)
     return 0
 
 
@@ -493,10 +879,38 @@ def main() -> int:
     parser.add_argument("--build", type=Path, default=DEFAULT_BUILD, help="build directory")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    doctor = subparsers.add_parser(
+        "doctor", help="check host dependencies and required submodules"
+    )
+    doctor.add_argument("--generator", help="CMake generator to probe")
+    doctor.set_defaults(func=command_doctor)
+
+    build = subparsers.add_parser("build", help="configure and build the simulator")
+    build.add_argument(
+        "--build-type",
+        choices=("Debug", "Release", "RelWithDebInfo", "MinSizeRel"),
+        default="Debug",
+    )
+    build.add_argument("--generator", help="CMake generator (fresh builds default to Ninja)")
+    build.add_argument("--heap-mb", type=int, default=16, help="simulated furi heap size")
+    build.add_argument("--jobs", type=int, help="parallel build jobs")
+    build.add_argument("--test", action="store_true", help="run the end-to-end smoke test")
+    build.set_defaults(func=command_build)
+
     start = subparsers.add_parser("start", help="launch a simulator and wait for its API")
     start.add_argument("--scene", help="app to boot into, as --scene does")
     start.add_argument("--shots", type=Path, default=Path("/tmp/busybar-sim-shots"))
-    start.add_argument("--port", type=int, default=DEFAULT_PORT)
+    start.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="loopback API port; 0 selects an available port",
+    )
+    start.add_argument(
+        "--state-dir",
+        type=Path,
+        help="persistent writable state directory (default: fresh temporary state)",
+    )
     start.add_argument("extra", nargs="*", help="further arguments for the simulator")
     start.set_defaults(func=command_start)
 
@@ -540,6 +954,12 @@ def main() -> int:
 
     status = subparsers.add_parser("status", help="session and device state")
     status.set_defaults(func=command_status)
+
+    power = subparsers.add_parser("power", help="inspect or change simulated battery state")
+    power.add_argument("--charge", type=int, help="battery percentage (0..100)")
+    power.add_argument("--usb", choices=("connected", "disconnected"))
+    power.add_argument("--charging", choices=("yes", "no"))
+    power.set_defaults(func=command_power)
 
     log = subparsers.add_parser("log", help="tail the simulator's log")
     log.add_argument("--lines", type=int, default=40)

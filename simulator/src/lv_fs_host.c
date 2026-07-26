@@ -8,6 +8,8 @@
  *
  * The drive letter stays 'C' so asset paths in the UI code are unchanged.
  */
+#include "storage_host.h"
+
 #include <lvgl_addons/fs/lv_fs.h>
 
 #include <furi.h>
@@ -18,18 +20,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-static char lv_fs_host_root[512];
-
 static void lv_fs_host_resolve(const char* path, char* out, size_t out_size) {
     /* LVGL hands over the path with the drive prefix already stripped. */
-    snprintf(out, out_size, "%s/%s", lv_fs_host_root, path[0] == '/' ? path + 1 : path);
+    if(!storage_host_resolve_path(path, out, out_size)) out[0] = '\0';
 }
 
 static void* lv_fs_host_open(lv_fs_drv_t* drv, const char* path, lv_fs_mode_t mode) {
     UNUSED(drv);
 
     char resolved[1024];
-    lv_fs_host_resolve(path, resolved, sizeof(resolved));
+    if(mode & LV_FS_MODE_WR) {
+        if(!storage_host_resolve_write_path(path, resolved, sizeof(resolved))) return NULL;
+    } else {
+        lv_fs_host_resolve(path, resolved, sizeof(resolved));
+    }
 
     FILE* file = fopen(resolved, mode == LV_FS_MODE_RD ? "rb" : "r+b");
     if(!file) {
@@ -122,15 +126,10 @@ static lv_fs_drv_t lv_fs_host_driver = {
 };
 
 void lv_storage_driver_init(void) {
-    /* Set by main() before the GUI service starts, so both this driver and
-     * the storage service resolve against the same tree. */
-    extern const char* simulator_assets_root;
-    snprintf(
-        lv_fs_host_root,
-        sizeof(lv_fs_host_root),
-        "%s",
-        simulator_assets_root ? simulator_assets_root : ".");
-
-    FURI_LOG_I("LvFsHost", "assets root: %s", lv_fs_host_root);
+    FURI_LOG_I(
+        "LvFsHost",
+        "assets: %s, state: %s",
+        storage_host_assets_root(),
+        storage_host_state_root());
     lv_fs_drv_register(&lv_fs_host_driver);
 }

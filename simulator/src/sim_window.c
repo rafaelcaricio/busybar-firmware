@@ -2,6 +2,7 @@
 #include "input_host.h"
 #include "sim_background.h"
 #include "sim_controls.h"
+#include "sim_host_alloc.h"
 #include "sim_led_panel.h"
 #include "sim_recorder.h"
 
@@ -14,15 +15,24 @@
 
 #include <furi.h>
 
+#include <inttypes.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define MARGIN         (20)
 #define GAP            (28)
 #define KEY_QUEUE_SIZE (64)
+
+#define SIM_FRONT_CAPTURE_SCALE (8)
+#define SIM_BACK_CAPTURE_SCALE  (4)
+#define SIM_CAPTURE_WAIT_MS      (5000)
+#define SIM_FRONT_BRIGHTNESS_MAX (100)
+#define SIM_BACK_CONTRAST_MAX    (71)
 
 /* Magnification to open at when none is asked for, in pixels per front LED.
  * The matrix is only 72x16, so below about a dozen pixels an LED the panel
@@ -56,16 +66,24 @@ static struct {
      * landing where they sit on the hardware. */
     SimBackground* front_background;
     SimBackground* back_background;
-    /* Magnification each panel ended up at, for the screenshot writer. */
-    int front_scale;
-    int back_scale;
-
     pthread_mutex_t lock;
     uint8_t front_pixels[FRONT_DISPLAY_W * FRONT_DISPLAY_H * 3];
     uint8_t back_pixels[BACK_DISPLAY_W * BACK_DISPLAY_H];
+    /* The buffers most recently uploaded to SDL. Screenshot captures copy
+     * these on the same render pass as the composited window, so all five PNGs
+     * describe one frame even while LVGL is animating. */
+    uint8_t front_presented[FRONT_DISPLAY_W * FRONT_DISPLAY_H * 3];
+    uint8_t back_presented[BACK_DISPLAY_W * BACK_DISPLAY_H * 3];
     bool front_dirty;
     bool back_dirty;
     bool front_blanked;
+    bool front_sleeping;
+    unsigned back_sleep_holders;
+    uint8_t front_brightness;
+    uint8_t back_contrast;
+    uint64_t front_updates;
+    uint64_t back_updates;
+    uint64_t frame_count;
 
     bool quit_requested;
 
@@ -77,14 +95,21 @@ static struct {
     bool selftest_pending;
     bool screenshot_pending;
 
-    /* Whole-window capture. The pixels can only be read on the SDL thread, but
-     * the PNG encoder allocates from furi's heap and so has to run in a task;
-     * these fields are the handshake between the two. */
+    /* Whole-window capture. Pixels can only be read on the SDL thread, while
+     * the comparatively slow PNG encoder runs in a task with host-only
+     * workspace; these fields are the handshake between the two. */
     uint8_t* window_capture;
+    uint8_t* front_capture;
+    uint8_t* back_capture;
     int window_capture_w;
     int window_capture_h;
     bool window_capture_pending;
+    bool window_capture_in_progress;
     bool window_capture_done;
+    bool window_capture_success;
+    uint64_t window_capture_frame;
+    bool screenshot_busy;
+    unsigned screenshot_sequence;
     int canvas_w;
     int canvas_h;
 
@@ -256,10 +281,8 @@ static void sim_window_resize_to_fit(int scale) {
 }
 
 bool sim_window_init(int scale) {
-    /* Replaced by the first layout pass; only matters if a screenshot beats
-     * it, and the writer cannot magnify by zero. */
-    sim.front_scale = 1;
-    sim.back_scale = 1;
+    sim.front_brightness = SIM_FRONT_BRIGHTNESS_MAX;
+    sim.back_contrast = SIM_BACK_CONTRAST_MAX;
     pthread_mutex_init(&sim.lock, NULL);
 
     /* Must be set before the renderer exists; per-texture scale modes are
@@ -288,8 +311,15 @@ bool sim_window_init(int scale) {
 
     sim.renderer = SDL_CreateRenderer(sim.window, -1, SDL_RENDERER_ACCELERATED);
     if(!sim.renderer) {
-        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
-        return false;
+        fprintf(
+            stderr,
+            "[sim] accelerated renderer unavailable (%s); using software rendering\n",
+            SDL_GetError());
+        sim.renderer = SDL_CreateRenderer(sim.window, -1, SDL_RENDERER_SOFTWARE);
+        if(!sim.renderer) {
+            fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+            return false;
+        }
     }
 
     /* LVGL's RGB888 is byte-order blue, green, red — see the static_asserts
@@ -355,6 +385,7 @@ void sim_window_submit_front(const uint8_t* pixels) {
     sim_window_lock();
     memcpy(sim.front_pixels, pixels, sizeof(sim.front_pixels));
     sim.front_dirty = true;
+    sim.front_updates++;
     sim_window_unlock();
 }
 
@@ -362,6 +393,7 @@ void sim_window_submit_back(const uint8_t* pixels) {
     sim_window_lock();
     memcpy(sim.back_pixels, pixels, sizeof(sim.back_pixels));
     sim.back_dirty = true;
+    sim.back_updates++;
     sim_window_unlock();
 }
 
@@ -369,6 +401,41 @@ void sim_window_set_front_blanked(bool blanked) {
     sim_window_lock();
     sim.front_blanked = blanked;
     sim.front_dirty = true;
+    sim_window_unlock();
+}
+
+void sim_window_set_front_sleeping(bool sleeping) {
+    sim_window_lock();
+    sim.front_sleeping = sleeping;
+    sim.front_dirty = true;
+    sim_window_unlock();
+}
+
+void sim_window_set_front_brightness(uint8_t brightness) {
+    sim_window_lock();
+    sim.front_brightness =
+        brightness > SIM_FRONT_BRIGHTNESS_MAX ? SIM_FRONT_BRIGHTNESS_MAX : brightness;
+    sim.front_dirty = true;
+    sim_window_unlock();
+}
+
+void sim_window_change_back_sleep(bool sleeping) {
+    sim_window_lock();
+    if(sleeping) {
+        sim.back_sleep_holders++;
+    } else if(sim.back_sleep_holders > 0) {
+        sim.back_sleep_holders--;
+    } else {
+        fprintf(stderr, "[sim] unbalanced back display sleep release\n");
+    }
+    sim.back_dirty = true;
+    sim_window_unlock();
+}
+
+void sim_window_set_back_contrast(uint8_t contrast) {
+    sim_window_lock();
+    sim.back_contrast = contrast > SIM_BACK_CONTRAST_MAX ? SIM_BACK_CONTRAST_MAX : contrast;
+    sim.back_dirty = true;
     sim_window_unlock();
 }
 
@@ -398,22 +465,35 @@ static void sim_window_upload(void) {
     back_dirty = sim.back_dirty;
 
     if(front_dirty) {
-        if(sim.front_blanked) {
+        memcpy(front_rgb, sim.front_pixels, sizeof(front_rgb));
+        if(sim.front_blanked || sim.front_sleeping) {
             memset(front_rgb, 0, sizeof(front_rgb));
         } else {
-            memcpy(front_rgb, sim.front_pixels, sizeof(front_rgb));
+            for(size_t i = 0; i < sizeof(front_rgb); i++) {
+                front_rgb[i] =
+                    (uint8_t)(((unsigned)front_rgb[i] * sim.front_brightness +
+                               SIM_FRONT_BRIGHTNESS_MAX / 2) /
+                              SIM_FRONT_BRIGHTNESS_MAX);
+            }
         }
+        memcpy(sim.front_presented, front_rgb, sizeof(sim.front_presented));
         sim.front_dirty = false;
     }
 
     if(back_dirty) {
         /* The back panel is 8bpp greyscale; expand to RGB for the texture. */
         for(size_t i = 0; i < sizeof(sim.back_pixels); i++) {
-            const uint8_t level = sim.back_pixels[i];
+            const uint8_t level =
+                sim.back_sleep_holders ?
+                    0 :
+                    (uint8_t)(((unsigned)sim.back_pixels[i] * sim.back_contrast +
+                               SIM_BACK_CONTRAST_MAX / 2) /
+                              SIM_BACK_CONTRAST_MAX);
             back_rgb[i * 3 + 0] = level;
             back_rgb[i * 3 + 1] = level;
             back_rgb[i * 3 + 2] = level;
         }
+        memcpy(sim.back_presented, back_rgb, sizeof(sim.back_presented));
         sim.back_dirty = false;
     }
     sim_window_unlock();
@@ -483,11 +563,6 @@ static void sim_window_layout(SimLayout* layout) {
     layout->back_display = sim_background_display_rect(sim.back_background, &layout->back_case);
     layout->front_window = sim_background_window_rect(sim.front_background, &layout->front_case);
 
-    /* Only the screenshot writer reads these, and it needs whole pixels. */
-    sim.front_scale = layout->front_display.w / FRONT_DISPLAY_W;
-    sim.back_scale = layout->back_display.w / BACK_DISPLAY_W;
-    if(sim.front_scale < 1) sim.front_scale = 1;
-    if(sim.back_scale < 1) sim.back_scale = 1;
 }
 
 bool sim_window_pump(void) {
@@ -589,20 +664,39 @@ bool sim_window_pump(void) {
     sim_window_unlock();
 
     sim_controls_render(sim.renderer, held);
-    /* Read back before presenting: after the swap the target is undefined. */
+    /* Read back before presenting: after the swap the target is undefined.
+     * Claim the request under the lock, then release it before SDL performs a
+     * potentially blocking GPU read. The caller owns all three buffers until
+     * window_capture_done is raised. */
+    bool captured_window = false;
+    bool capture_success = false;
+    uint8_t* capture_pixels = NULL;
+    int capture_width = 0;
+    int capture_height = 0;
+
     sim_window_lock();
     if(sim.window_capture_pending && sim.window_capture) {
-        const SDL_Rect area = {0, 0, sim.window_capture_w, sim.window_capture_h};
-        SDL_RenderReadPixels(
-            sim.renderer,
-            &area,
-            SDL_PIXELFORMAT_RGB24,
-            sim.window_capture,
-            sim.window_capture_w * 3);
+        capture_pixels = sim.window_capture;
+        capture_width = sim.window_capture_w;
+        capture_height = sim.window_capture_h;
+        memcpy(sim.front_capture, sim.front_presented, sizeof(sim.front_presented));
+        memcpy(sim.back_capture, sim.back_presented, sizeof(sim.back_presented));
         sim.window_capture_pending = false;
-        sim.window_capture_done = true;
+        sim.window_capture_in_progress = true;
+        captured_window = true;
     }
     sim_window_unlock();
+
+    if(captured_window) {
+        const SDL_Rect area = {0, 0, capture_width, capture_height};
+        capture_success =
+            SDL_RenderReadPixels(
+                sim.renderer,
+                &area,
+                SDL_PIXELFORMAT_RGB24,
+                capture_pixels,
+                capture_width * 3) == 0;
+    }
 
     /* A recording reads the same finished frame back, into buffers the
      * recorder allocated when it started: nothing here allocates, and a frame
@@ -617,6 +711,16 @@ bool sim_window_pump(void) {
 
     SDL_RenderPresent(sim.renderer);
 
+    sim_window_lock();
+    sim.frame_count++;
+    if(captured_window) {
+        sim.window_capture_success = capture_success;
+        sim.window_capture_frame = sim.frame_count;
+        sim.window_capture_in_progress = false;
+        sim.window_capture_done = true;
+    }
+    sim_window_unlock();
+
     return true;
 }
 
@@ -625,7 +729,7 @@ bool sim_window_pump(void) {
  * Nearest-neighbour on purpose: these are 72x16 and 160x80 panels and the
  * point of a screenshot is to inspect individual pixels.
  */
-static void sim_window_write_png(
+static bool sim_window_write_png(
     const char* path,
     const uint8_t* rgb,
     size_t width,
@@ -634,8 +738,8 @@ static void sim_window_write_png(
     uint8_t* scaled = NULL;
 
     if(scale > 1) {
-        scaled = malloc(width * height * scale * scale * 3);
-        if(!scaled) return;
+        scaled = sim_host_alloc(width * height * scale * scale * 3);
+        if(!scaled) return false;
 
         for(size_t y = 0; y < height * (size_t)scale; y++) {
             for(size_t x = 0; x < width * (size_t)scale; x++) {
@@ -653,6 +757,7 @@ static void sim_window_write_png(
      * ways and a 2048-byte match window — that is five seconds an image, and
      * the point of on-demand capture is to take them in a loop. Filtering up
      * and a short window costs about a third more bytes on disk. */
+    sim_host_allocator_enter();
     LodePNGState state;
     lodepng_state_init(&state);
     state.info_raw.colortype = LCT_RGB;
@@ -677,20 +782,25 @@ static void sim_window_write_png(
 
     lodepng_state_cleanup(&state);
 
+    bool written = false;
     if(error) {
         fprintf(stderr, "[sim] png encode failed for %s: %u\n", path, error);
     } else {
         FILE* file = fopen(path, "wb");
         if(file) {
-            fwrite(png, 1, png_size, file);
-            fclose(file);
+            const bool complete = fwrite(png, 1, png_size, file) == png_size;
+            const bool closed = fclose(file) == 0;
+            written = complete && closed;
+            if(!written) fprintf(stderr, "[sim] could not finish writing %s\n", path);
         } else {
             fprintf(stderr, "[sim] could not open %s for writing\n", path);
         }
     }
 
-    free(png);
-    free(scaled);
+    sim_host_free(png);
+    sim_host_allocator_leave();
+    sim_host_free(scaled);
+    return written;
 }
 
 void sim_window_request_selftest(void) {
@@ -724,6 +834,33 @@ void sim_window_request_quit(void) {
     sim_window_unlock();
 }
 
+void sim_window_status(SimWindowStatus* status) {
+    sim_window_lock();
+    status->frames = sim.frame_count;
+    status->front_updates = sim.front_updates;
+    status->back_updates = sim.back_updates;
+    status->canvas_width = sim.canvas_w;
+    status->canvas_height = sim.canvas_h;
+    status->quitting = sim.quit_requested;
+    sim_window_unlock();
+}
+
+bool sim_window_wait_for_frame(uint64_t target, uint32_t timeout_ms) {
+    uint32_t waited = 0;
+
+    while(true) {
+        SimWindowStatus status;
+        sim_window_status(&status);
+        if(status.frames >= target) return true;
+        if(status.quitting || waited >= timeout_ms) return false;
+
+        const uint32_t delay = timeout_ms - waited < 5 ? timeout_ms - waited : 5;
+        if(delay == 0) return false;
+        furi_delay_ms(delay);
+        waited += delay;
+    }
+}
+
 void sim_window_canvas_size(int* width, int* height) {
     sim_window_lock();
     *width = sim.canvas_w;
@@ -745,87 +882,240 @@ static void sim_window_capture_path(
     }
 }
 
-/** Ask the SDL thread for the composited window and write it out.
- *
- * Unlike the per-panel images this shows the device and the layout around the
- * panels, which is the only way to check the window presentation. */
-static void sim_window_capture_window(const char* directory, unsigned sequence) {
+static bool sim_window_capture_sequence_exists(const char* directory, unsigned sequence) {
+    static const char* names[] = {"front-raw", "back-raw", "front", "back", "window"};
+    char path[1024];
+
+    for(size_t i = 0; i < COUNT_OF(names); i++) {
+        sim_window_capture_path(path, sizeof(path), directory, names[i], sequence);
+        if(access(path, F_OK) == 0) return true;
+    }
+    return false;
+}
+
+/** Reserve the one capture handshake shared by exit, F12, signals and tools. */
+static bool sim_window_begin_screenshot(
+    const char* directory,
+    bool numbered,
+    unsigned requested,
+    unsigned* sequence) {
+    for(uint32_t waited = 0; waited < SIM_CAPTURE_WAIT_MS; waited += 5) {
+        sim_window_lock();
+        if(!sim.screenshot_busy) {
+            sim.screenshot_busy = true;
+            if(numbered) {
+                do {
+                    *sequence = ++sim.screenshot_sequence;
+                } while(
+                    sim_window_capture_sequence_exists(directory, *sequence) &&
+                    sim.screenshot_sequence != UINT_MAX);
+            } else {
+                *sequence = requested;
+                if(requested > sim.screenshot_sequence) sim.screenshot_sequence = requested;
+            }
+            sim_window_unlock();
+            return true;
+        }
+        const bool quitting = sim.quit_requested;
+        sim_window_unlock();
+
+        if(quitting) return false;
+        furi_delay_ms(5);
+    }
+
+    fprintf(stderr, "[sim] another screenshot did not finish within %u ms\n", SIM_CAPTURE_WAIT_MS);
+    return false;
+}
+
+static void sim_window_end_screenshot(void) {
     sim_window_lock();
-    const int width = sim.canvas_w;
-    const int height = sim.canvas_h;
+    sim.screenshot_busy = false;
+    sim_window_unlock();
+}
+
+/** Ask the SDL thread for one coherent snapshot of both panels and the window. */
+static bool sim_window_capture_snapshot(
+    uint8_t* front,
+    uint8_t* back,
+    uint8_t** window,
+    int* width,
+    int* height,
+    uint64_t* captured_frame) {
+    sim_window_lock();
+    *width = sim.canvas_w;
+    *height = sim.canvas_h;
     sim_window_unlock();
 
-    if(width <= 0 || height <= 0) return;
+    if(*width <= 0 || *height <= 0 ||
+       (size_t)*width > SIZE_MAX / (size_t)*height / 3) {
+        return false;
+    }
 
-    uint8_t* pixels = malloc((size_t)width * height * 3);
-    if(!pixels) return;
+    *window = sim_host_alloc((size_t)*width * (size_t)*height * 3);
+    if(!*window) return false;
 
     sim_window_lock();
-    sim.window_capture = pixels;
-    sim.window_capture_w = width;
-    sim.window_capture_h = height;
+    sim.window_capture = *window;
+    sim.front_capture = front;
+    sim.back_capture = back;
+    sim.window_capture_w = *width;
+    sim.window_capture_h = *height;
     sim.window_capture_done = false;
+    sim.window_capture_success = false;
+    sim.window_capture_frame = 0;
+    sim.window_capture_in_progress = false;
     sim.window_capture_pending = true;
     sim_window_unlock();
 
-    /* The SDL thread fills this on its next present. */
+    /* The SDL thread fills all three buffers on its next present. */
     bool done = false;
-    for(int attempt = 0; attempt < 100 && !done; attempt++) {
-        furi_delay_ms(20);
+    for(uint32_t waited = 0; waited < SIM_CAPTURE_WAIT_MS && !done; waited += 5) {
+        furi_delay_ms(5);
         sim_window_lock();
         done = sim.window_capture_done;
         sim_window_unlock();
     }
 
-    if(done) {
-        char path[1024];
-        sim_window_capture_path(path, sizeof(path), directory, "window", sequence);
-        sim_window_write_png(path, pixels, (size_t)width, (size_t)height, 1);
-    } else {
-        fprintf(stderr, "[sim] window capture timed out\n");
-    }
-
     sim_window_lock();
-    sim.window_capture = NULL;
-    sim.window_capture_pending = false;
+    const bool in_progress = sim.window_capture_in_progress;
+    const bool success = done && sim.window_capture_success;
+    if(done) *captured_frame = sim.window_capture_frame;
+
+    if(!in_progress) {
+        sim.window_capture = NULL;
+        sim.front_capture = NULL;
+        sim.back_capture = NULL;
+        sim.window_capture_pending = false;
+    }
     sim_window_unlock();
 
-    free(pixels);
+    if(in_progress) {
+        /* Do not free buffers SDL may still be filling. A wedged GPU read is
+         * not recoverable inside this process, so request an orderly exit and
+         * deliberately leave the buffers alive until then. */
+        fprintf(stderr, "[sim] window capture remained in progress for %u ms\n", SIM_CAPTURE_WAIT_MS);
+        sim_window_request_quit();
+        *window = NULL;
+        return false;
+    }
+    if(!done) fprintf(stderr, "[sim] window capture timed out\n");
+
+    return success;
 }
 
-void sim_window_screenshot(const char* directory, unsigned sequence) {
-    uint8_t front_rgb[sizeof(sim.front_pixels)];
-    uint8_t back_rgb[BACK_DISPLAY_W * BACK_DISPLAY_H * 3];
-    int front_scale;
-    int back_scale;
+static bool sim_window_screenshot_impl(
+    const char* directory,
+    bool numbered,
+    unsigned requested_sequence,
+    unsigned* actual_sequence,
+    uint64_t* captured_frame) {
+    unsigned sequence = 0;
+    if(!sim_window_begin_screenshot(directory, numbered, requested_sequence, &sequence)) return false;
 
-    sim_window_lock();
-    /* Swap to RGB for the encoder; the panel buffer is BGR. */
-    for(size_t i = 0; i < sizeof(front_rgb); i += 3) {
-        front_rgb[i + 0] = sim.front_pixels[i + 2];
-        front_rgb[i + 1] = sim.front_pixels[i + 1];
-        front_rgb[i + 2] = sim.front_pixels[i + 0];
+    const size_t front_size = sizeof(sim.front_presented);
+    const size_t back_size = sizeof(sim.back_presented);
+    uint8_t* front_rgb = sim_host_alloc(front_size);
+    uint8_t* back_rgb = sim_host_alloc(back_size);
+    uint8_t* window_rgb = NULL;
+    int window_width = 0;
+    int window_height = 0;
+    uint64_t frame = 0;
+
+    if(!front_rgb || !back_rgb) {
+        fprintf(stderr, "[sim] out of memory for panel capture buffers\n");
+        sim_host_free(front_rgb);
+        sim_host_free(back_rgb);
+        sim_window_end_screenshot();
+        return false;
     }
-    for(size_t i = 0; i < sizeof(sim.back_pixels); i++) {
-        const uint8_t level = sim.back_pixels[i];
-        back_rgb[i * 3 + 0] = level;
-        back_rgb[i * 3 + 1] = level;
-        back_rgb[i * 3 + 2] = level;
+
+    const bool captured = sim_window_capture_snapshot(
+        front_rgb,
+        back_rgb,
+        &window_rgb,
+        &window_width,
+        &window_height,
+        &frame);
+
+    if(captured) {
+        /* SDL's front texture is BGR24 because that is LVGL's byte order.
+         * PNG output is conventional RGB. */
+        for(size_t i = 0; i < front_size; i += 3) {
+            const uint8_t red = front_rgb[i + 2];
+            front_rgb[i + 2] = front_rgb[i + 0];
+            front_rgb[i + 0] = red;
+        }
     }
-    front_scale = sim.front_scale;
-    back_scale = sim.back_scale;
-    sim_window_unlock();
 
     char path[1024];
 
+    sim_window_capture_path(path, sizeof(path), directory, "front-raw", sequence);
+    const bool front_raw_written =
+        captured &&
+        sim_window_write_png(path, front_rgb, FRONT_DISPLAY_W, FRONT_DISPLAY_H, 1);
+
+    sim_window_capture_path(path, sizeof(path), directory, "back-raw", sequence);
+    const bool back_raw_written =
+        captured &&
+        sim_window_write_png(path, back_rgb, BACK_DISPLAY_W, BACK_DISPLAY_H, 1);
+
     sim_window_capture_path(path, sizeof(path), directory, "front", sequence);
-    sim_window_write_png(path, front_rgb, FRONT_DISPLAY_W, FRONT_DISPLAY_H, front_scale);
+    const bool front_written =
+        captured && sim_window_write_png(
+                        path,
+                        front_rgb,
+                        FRONT_DISPLAY_W,
+                        FRONT_DISPLAY_H,
+                        SIM_FRONT_CAPTURE_SCALE);
 
     sim_window_capture_path(path, sizeof(path), directory, "back", sequence);
-    sim_window_write_png(path, back_rgb, BACK_DISPLAY_W, BACK_DISPLAY_H, back_scale);
-
-    sim_window_capture_window(directory, sequence);
+    const bool back_written =
+        captured && sim_window_write_png(
+                        path,
+                        back_rgb,
+                        BACK_DISPLAY_W,
+                        BACK_DISPLAY_H,
+                        SIM_BACK_CAPTURE_SCALE);
 
     sim_window_capture_path(path, sizeof(path), directory, "window", sequence);
-    fprintf(stderr, "[sim] wrote %s and its two panels\n", path);
+    const bool window_written =
+        captured && sim_window_write_png(
+                        path,
+                        window_rgb,
+                        (size_t)window_width,
+                        (size_t)window_height,
+                        1);
+
+    const bool written =
+        front_raw_written && back_raw_written && front_written && back_written && window_written;
+    if(written) {
+        fprintf(
+            stderr,
+            "[sim] wrote %s and four panel images at frame %" PRIu64 "\n",
+            path,
+            frame);
+    } else {
+        fprintf(stderr, "[sim] screenshot failed in %s\n", directory);
+    }
+
+    sim_host_free(window_rgb);
+    sim_host_free(back_rgb);
+    sim_host_free(front_rgb);
+
+    if(actual_sequence) *actual_sequence = sequence;
+    if(captured_frame) *captured_frame = frame;
+    sim_window_end_screenshot();
+
+    return written;
+}
+
+bool sim_window_screenshot(const char* directory, unsigned sequence) {
+    return sim_window_screenshot_impl(directory, false, sequence, NULL, NULL);
+}
+
+bool sim_window_screenshot_next(
+    const char* directory,
+    unsigned* sequence,
+    uint64_t* captured_frame) {
+    return sim_window_screenshot_impl(directory, true, 0, sequence, captured_frame);
 }

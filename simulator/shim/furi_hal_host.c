@@ -9,6 +9,7 @@
 
 #include <FreeRTOS.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
@@ -32,8 +33,9 @@ size_t furi_hal_memory_max_pool_block(void) {
 /** The simulator's stand-in for the linker-provided heap section.
  *
  * furi's allocator carves everything out of this, exactly as it does out of
- * SRAM on the device. Sized well above the firmware's budget so that UI work
- * is not the thing that runs out of room first.
+ * SRAM on the device. The default is deliberately finite enough to expose
+ * leaks while leaving room for host-only screenshots and recorder buffers;
+ * CMake exposes BUSYBAR_SIM_HEAP_MB for stress runs.
  */
 static uint8_t furi_hal_memory_heap[FURI_HAL_MEMORY_HEAP_SIZE];
 
@@ -102,17 +104,6 @@ static int64_t furi_hal_rtc_host_now_ms(void) {
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
-/** Seconds to add to a UTC timestamp to get workstation wall-clock time.
- *
- * The device RTC holds local time, with the timezone applied by the time
- * service, so the simulator has to shift too or clock faces read as UTC.
- */
-static int32_t furi_hal_rtc_local_offset(time_t utc) {
-    struct tm local;
-    localtime_r(&utc, &local);
-    return (int32_t)local.tm_gmtoff;
-}
-
 DateTimeMs furi_hal_rtc_get_datetime(void) {
     const int64_t now_ms = furi_hal_rtc_host_now_ms() + furi_hal_rtc_offset_ms;
     const time_t utc = (time_t)(now_ms / 1000);
@@ -120,7 +111,7 @@ DateTimeMs furi_hal_rtc_get_datetime(void) {
     DateTimeMs result;
     /* Reuse the datetime library rather than mapping struct tm by hand: it
      * owns the dayofweek convention the widgets expect. */
-    result.dt = datetime_timestamp_to_datetime(utc + furi_hal_rtc_local_offset(utc));
+    result.dt = datetime_timestamp_to_datetime(utc);
     result.millis = (uint16_t)(now_ms % 1000);
 
     return result;
@@ -128,8 +119,7 @@ DateTimeMs furi_hal_rtc_get_datetime(void) {
 
 void furi_hal_rtc_set_datetime(const DateTimeMs* datetime) {
     furi_check(datetime);
-    const time_t local = datetime_datetime_to_timestamp(&datetime->dt);
-    const time_t utc = local - furi_hal_rtc_local_offset(local);
+    const time_t utc = datetime_datetime_to_timestamp(&datetime->dt);
     furi_hal_rtc_offset_ms =
         ((int64_t)utc * 1000 + datetime->millis) - furi_hal_rtc_host_now_ms();
 }
@@ -148,6 +138,13 @@ time_t furi_hal_rtc_get_timestamp_ms(void) {
  * region above; it supplies pvPortMalloc and the xPortGet*HeapSize family. */
 
 void vApplicationMallocFailedHook(void) {
+    extern size_t xPortGetFreeHeapSize(void);
+    extern size_t xPortGetMinimumEverFreeHeapSize(void);
+    fprintf(
+        stderr,
+        "[sim] heap allocation failed: %zu bytes free, %zu minimum ever free\n",
+        xPortGetFreeHeapSize(),
+        xPortGetMinimumEverFreeHeapSize());
     furi_crash("Out of memory");
 }
 

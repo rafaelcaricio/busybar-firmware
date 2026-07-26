@@ -5,110 +5,130 @@ description: Run the BUSY Bar firmware on the workstation and check a change by 
 
 # Validating firmware in the simulator
 
-`simulator/` builds the firmware as a native binary with the displays on SDL.
-Both panels render, every GUI app runs, and the firmware's own HTTP API takes
-button presses — so a UI change can be *seen* rather than reasoned about. Do
-that. A screenshot settles in one step what reading three widget files does not.
+`simulator/` builds the firmware as a native binary with both displays on SDL.
+Every GUI app runs, and the firmware's own HTTP API takes button presses. Use
+rendered evidence for GUI, scene, widget, animation and asset work; do not infer
+the final screen only from code.
 
-## Build it once
+## Build and diagnose
 
 ```sh
-cmake -S simulator -B simulator/build -G Ninja
-cmake --build simulator/build
+simulator/tools/simctl.py doctor
+simulator/tools/simctl.py build --test
 ```
 
-Reconfigure (not just rebuild) after touching anything under `assets/` or an
-app's `resources/`: the asset tree is generated at configure time.
+`doctor` probes the real CMake configuration in a temporary directory.
+`build --test` configures, builds and runs the headless end-to-end smoke test.
+Generated sources and runtime assets are tracked build dependencies, so a
+plain rebuild notices edits under `assets/` and application `resources/`.
 
-## The loop
-
-`simulator/tools/simctl.py` is the driver. It handles waiting for the API,
-waiting for a capture to finish, and the key names.
+For a non-default build directory, place the global option before the command:
 
 ```sh
-simulator/tools/simctl.py start --scene busy --shots /tmp/shots
-simulator/tools/simctl.py run next ok shot:setup next ok shot:theme
-simulator/tools/simctl.py log --lines 40
+simulator/tools/simctl.py --build /tmp/busybar-build build --test
+```
+
+## The validation loop
+
+```sh
+simulator/tools/simctl.py start --scene busy --shots /tmp/shots --port 0
+simulator/tools/simctl.py run next ok frames:30 shot:setup next ok shot:theme
+simulator/tools/simctl.py status
+simulator/tools/simctl.py log --lines 60
 simulator/tools/simctl.py stop
 ```
 
-`run` takes button names, `shot`, `shot:<label>` and `wait:<seconds>` in one
-line. Each capture prints the three files it wrote; read them.
+`start` waits for the HTTP API, updates from both displays, valid canvas
+dimensions and two stable presented frames. It does not return merely because a
+socket opened. Port `0` selects an available loopback port. State is isolated
+in a fresh temporary overlay by default; pass `--state-dir DIR` when a restart
+must retain settings.
 
 | command | what it does |
 | --- | --- |
-| `start [--scene NAME] [--shots DIR] [--port N]` | launch and wait for the API to answer |
-| `press KEY...` | one or more buttons |
-| `shot [LABEL]` | capture, wait for the encode, print the paths |
-| `run STEP...` | keys, `shot`, `shot:label`, `wait:N` in sequence |
-| `record --out FILE.gif STEP...` | the same steps, with the window recorded to a GIF |
-| `status` | pid, port, capture directory, firmware version, uptime |
-| `log [--lines N]` | tail the simulator's output |
-| `stop` | end the session |
+| `doctor` | check compiler, SDL2, networking dependencies and submodules |
+| `build [--test]` | configure/build and optionally run the smoke regression |
+| `start [--scene NAME] [--shots DIR] [--port N] [--state-dir DIR]` | launch and wait for deterministic readiness |
+| `press KEY...` | send one or more buttons and settle on rendered frames |
+| `shot [LABEL]` | synchronously capture one coherent render and print five paths |
+| `run STEP...` | keys, `shot`, `shot:label`, `frames:N`, `wait:N` |
+| `record --out FILE.gif STEP...` | record the window while the same steps run |
+| `status` | process/render revisions, heap free/low-water, firmware and uptime |
+| `power ...` | inspect or inject charge, USB and charging scenarios |
+| `log [--lines N]` | tail output; it remains useful after a crash |
+| `stop` | request graceful shutdown and clean only tool-owned temporary state |
 
-`record` is for the things a still cannot show — a wipe between scenes, a label
-scrolling because it does not fit, a timer counting down — and for showing
-someone the change rather than describing it. It needs ffmpeg on PATH:
+Duration waits and per-key settling are converted to presented-frame waits.
+Use `frames:N` where an exact boundary matters.
 
-```sh
-simulator/tools/simctl.py record --out /tmp/demo.gif wait:1 start wait:4 apps wait:2
-simulator/tools/simctl.py record --out /tmp/idle.gif wait:15   # no buttons, just time
-```
+## Reading captures
 
-Judge a layout from `back.png` and `front.png` — a GIF is scaled down and
-palettised, so it is the wrong thing to check a one-pixel misalignment in.
+Each shot writes five PNGs from one render pass:
 
-Each capture writes three files. **`back.png` and `front.png` are the ones to
-read**: they are the framebuffers magnified pixel for pixel, so text is legible
-and a one-pixel misalignment is visible. `window.png` is the whole window with
-the device drawn around the panels — read it to judge presentation, not layout.
+- `front-raw`: exact 72x16 physical front framebuffer.
+- `back-raw`: exact 160x80 physical back framebuffer.
+- `front`: fixed 8x inspection image, 576x128.
+- `back`: fixed 4x inspection image, 640x320.
+- `window`: the device renders, displays and controls together.
+
+For a label such as `setup`, the names are `setup-front-raw.png`,
+`setup-back.png`, and so on. Without a label, captures are numbered without
+overwriting earlier runs.
+
+Read `front`/`back` or their raw counterparts to judge a one-pixel layout
+detail. Read `window` to judge presentation. A GIF is scaled and palettised;
+use it for transitions, scrolling and timers, not pixel alignment.
+
+Before reporting success:
+
+1. Open the relevant panel image and the window image.
+2. Run `log --lines N` and check for `[E]`, asserts and asset-load failures.
+3. Use `status` when heap behavior, exact build identity or uptime matters.
+4. Stop the session, including after a failed validation.
+
+Anything the firmware exposes is reachable directly with `curl` on the port
+printed by `start`. Brightness and timezone settings persist with an explicit
+state directory. `power --charge 5 --usb disconnected` exercises low-battery
+branches without changing firmware APIs.
 
 ## Button names
 
 `next` and `prev` move the highlight down and up the list. Prefer them.
 
-They exist because the underlying `/api/input` speaks the *device's* names,
-where `up` and `down` are directions of dial rotation, and rotating "up" moves
-the highlight **down**. That inversion is the device's real contract, so
-`simctl.py` still accepts `up`/`down` and passes them through untouched — but
-if you type `up` meaning "move up the list", you will get the opposite and
-misread the result. The other buttons are literal: `ok`, `back`, `start`, and
-the five lever positions `busy`, `custom`, `off`, `apps`, `settings`.
+The underlying `/api/input` speaks the device's names: `up` and `down` are dial
+rotation directions, and device `up` moves the highlight down. `simctl.py`
+passes those names through because that is the hardware contract, but also
+provides the unambiguous aliases. Other buttons are `ok`, `back`, `start`, and
+the lever positions `busy`, `custom`, `off`, `apps`, `settings`.
 
-## Reading the result
+## Common traps
 
-- Screenshots are the evidence. Look at the image before saying a change works.
-- `log --lines N` catches what a screenshot cannot: `[E]` lines from a service,
-  a failed asset load, an assert. Check it even when the picture looks right.
-- `status` returns the device's own `/api/status` JSON, so the firmware version
-  and uptime come from the running build rather than from assumption.
-- Anything the firmware exposes is reachable: `curl` the API directly for
-  endpoints `simctl.py` does not wrap.
+- A startup wipe can still be in progress after readiness. Add `frames:N` or
+  `wait:N` for the state being tested; do not add an arbitrary shell sleep.
+- A blank or stale panel is commonly an asset failure. Check the log first.
+- `[E][AnimFile] Load error` names neither reason nor file. Temporarily enable
+  `ANIM_FILE_DETAILED_ERRORS` in `lib/anim_file/anim_file_i.h` and log the
+  player's `instance->file_path` when `AnimFileFrameFlagError` is returned.
+- The HTTP API binds only to `127.0.0.1` and mDNS is disabled by default. Use
+  `--network` only when LAN exposure is intended.
+- A default session has disposable state. Persistence tests must pass the same
+  explicit `--state-dir` to both starts.
 
-## Things that will cost you an hour
+## When changing the simulator itself
 
-- **A capture takes about two seconds.** Nearly all of it is encoding the
-  window. `simctl.py shot` waits for the simulator's own "wrote" log line, so
-  use it rather than sleeping and listing the directory — a bare `ls` right
-  after the trigger finds nothing, or finds a half-written file.
-- **The first frames are not the app.** The desktop service boots, the loader
-  starts the app, and the wipe animation plays. `start` returns once the API
-  answers, which is earlier than that. Capture, look, and add `wait:1` if the
-  screen is still mid-transition.
-- **A blank or stale panel is usually an asset, not a widget.** Check the log
-  for `AnimFile` or asset errors first.
-- **`[E][AnimFile] Load error` names neither the reason nor the file.** Every
-  failure site logs that one string, and `AnimFile` never sees the path. Turn on
-  `ANIM_FILE_DETAILED_ERRORS` in `lib/anim_file/anim_file_i.h` for the reason,
-  and log `instance->file_path` from `anim_player_timer_cb` on
-  `AnimFileFrameFlagError` for the file. Revert both afterwards.
-- **Reconfigure after asset changes.** A plain `cmake --build` will not notice
-  a new PNG, animation zip or `resources/` file.
+Read the relevant section of `simulator/README.md` first. Keep these invariants:
 
-## When the simulator is the thing being changed
-
-`simulator/README.md` is thorough and current — read the section that covers
-what you are touching before editing. In particular: every SDL call belongs on
-the main thread, the PNG encoder allocates from furi's heap and so must run in
-a task, and the FreeRTOS POSIX port has already claimed `SIGALRM` and
-`SIGUSR1`.
+- SDL calls and GPU read-back stay on the main thread.
+- PNG encoding stays in a task, while raw/scaled buffers and codec workspace
+  use the mmap-backed host allocator so evidence capture does not perturb the
+  measured furi heap. Large buffers never belong on an 8 KiB task stack.
+- The FreeRTOS port owns `SIGALRM` and `SIGUSR1`. A pthread mutex reachable
+  from task code must not allow preemption while a task owns it.
+- On ELF hosts, furi's `malloc`/`free` definitions must stay hidden from the
+  dynamic symbol table so SDL and other shared libraries keep using libc.
+- Generated files and assets are build outputs with complete dependencies;
+  never require developers to remember a manual reconfigure.
+- Base assets are immutable. All runtime writes go to the contained state
+  overlay, and recursive operations must never follow symlinks out of it.
+- Finish with a clean build, CTest, a driven capture that you inspect, and a
+  log check.

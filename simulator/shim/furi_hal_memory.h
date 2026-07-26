@@ -23,7 +23,11 @@ extern "C" {
  * with the display the simulator is running on, and the state publisher's
  * frame buffers. The pages are untouched until something asks for them.
  */
-#define FURI_HAL_MEMORY_HEAP_SIZE (192 * 1024 * 1024)
+#ifndef BUSYBAR_SIM_HEAP_SIZE
+#define BUSYBAR_SIM_HEAP_SIZE (16 * 1024 * 1024)
+#endif
+
+#define FURI_HAL_MEMORY_HEAP_SIZE BUSYBAR_SIM_HEAP_SIZE
 
 typedef enum {
     FuriHalMemoryRegionIdHeap,

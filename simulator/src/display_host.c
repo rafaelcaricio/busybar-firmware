@@ -33,7 +33,7 @@ void front_display_draw(FrontDisplaySrv* instance, const uint8_t* buf) {
 
 void front_display_set_brightness(FrontDisplaySrv* instance, FrontDisplayBrightness brightness) {
     UNUSED(instance);
-    UNUSED(brightness);
+    sim_window_set_front_brightness(brightness.val);
 }
 
 void front_display_set_blanked(FrontDisplaySrv* instance, bool is_blanked) {
@@ -43,7 +43,7 @@ void front_display_set_blanked(FrontDisplaySrv* instance, bool is_blanked) {
 
 void front_display_sleep_mode(FrontDisplaySrv* instance, bool sleep) {
     UNUSED(instance);
-    sim_window_set_front_blanked(sleep);
+    sim_window_set_front_sleeping(sleep);
 }
 
 /* -- back --------------------------------------------------------------- */
@@ -56,12 +56,12 @@ void back_display_draw(BackDisplaySrv* instance, const uint8_t* data) {
 
 void back_display_sleep_mode(BackDisplaySrv* instance, bool sleep) {
     UNUSED(instance);
-    UNUSED(sleep);
+    sim_window_change_back_sleep(sleep);
 }
 
 void back_display_set_contrast(BackDisplaySrv* instance, BackDisplayContrast contrast) {
     UNUSED(instance);
-    UNUSED(contrast);
+    sim_window_set_back_contrast(contrast.val);
 }
 
 size_t back_display_get_width(void) {

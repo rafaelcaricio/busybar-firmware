@@ -1,9 +1,11 @@
 #include "sim_recorder.h"
+#include "sim_host_alloc.h"
 #include "sim_window.h"
 
 #include <furi.h>
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +66,38 @@ static struct {
     .filling = -1,
 };
 
+/* A FreeRTOS task must not be tick-preempted while it owns a host mutex. The
+ * replacement task is a different pthread and can otherwise block on the
+ * parked owner's lock while the scheduler believes that replacement is the
+ * only runnable thread. The SDL main thread already has SIGALRM blocked. */
+static _Thread_local sigset_t recorder_previous_signal_mask;
+
+static void sim_recorder_lock(void) {
+    sigset_t tick_signal;
+    sigemptyset(&tick_signal);
+    sigaddset(&tick_signal, SIGALRM);
+
+    int error = pthread_sigmask(SIG_BLOCK, &tick_signal, &recorder_previous_signal_mask);
+    if(error == 0) error = pthread_mutex_lock(&recorder.lock);
+    if(error != 0) {
+        fprintf(stderr, "[sim] recorder lock failed: %s\n", strerror(error));
+        abort();
+    }
+}
+
+static void sim_recorder_unlock(void) {
+    const int unlock_error = pthread_mutex_unlock(&recorder.lock);
+    const int mask_error =
+        pthread_sigmask(SIG_SETMASK, &recorder_previous_signal_mask, NULL);
+    if(unlock_error != 0 || mask_error != 0) {
+        fprintf(
+            stderr,
+            "[sim] recorder unlock failed: %s\n",
+            strerror(unlock_error ? unlock_error : mask_error));
+        abort();
+    }
+}
+
 /** Average each divisor x divisor block down to one pixel.
  *
  * A box filter rather than a sample: the front panel is a grid of lit dots on
@@ -101,23 +135,23 @@ static void sim_recorder_downscale(const uint8_t* source, uint8_t* target) {
 static int sim_recorder_dequeue(bool* stopping) {
     int index = -1;
 
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
     if(recorder.queue_count > 0) {
         index = recorder.queue[recorder.queue_head];
         recorder.queue_head = (recorder.queue_head + 1) % SIM_RECORDER_POOL;
         recorder.queue_count--;
     }
     *stopping = recorder.writer_stop;
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 
     return index;
 }
 
 static void sim_recorder_release(int index, bool written) {
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
     recorder.free_list[recorder.free_count++] = index;
     if(written) recorder.frames++;
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 }
 
 /** Scale and write queued frames until stop() has said there are no more.
@@ -159,11 +193,11 @@ static int32_t sim_recorder_writer(void* context) {
 
 static void sim_recorder_free_buffers(void) {
     for(int i = 0; i < SIM_RECORDER_POOL; i++) {
-        free(recorder.pool[i]);
+        sim_host_free(recorder.pool[i]);
         recorder.pool[i] = NULL;
     }
 
-    free(recorder.scaled);
+    sim_host_free(recorder.scaled);
     recorder.scaled = NULL;
 }
 
@@ -178,9 +212,9 @@ bool sim_recorder_start(const char* path, int fps, int divisor, char* error, siz
         return false;
     }
 
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
     const bool busy = recorder.running;
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 
     if(busy) {
         snprintf(error, error_size, "already recording");
@@ -229,7 +263,7 @@ bool sim_recorder_start(const char* path, int fps, int divisor, char* error, siz
     const size_t frame_size = (size_t)width * height * 3;
 
     for(int i = 0; i < SIM_RECORDER_POOL; i++) {
-        recorder.pool[i] = malloc(frame_size);
+        recorder.pool[i] = sim_host_alloc(frame_size);
         if(!recorder.pool[i]) {
             sim_recorder_free_buffers();
             fclose(stream);
@@ -241,7 +275,7 @@ bool sim_recorder_start(const char* path, int fps, int divisor, char* error, siz
     }
 
     if(divisor > 1) {
-        recorder.scaled = malloc((size_t)out_width * out_height * 3);
+        recorder.scaled = sim_host_alloc((size_t)out_width * out_height * 3);
         if(!recorder.scaled) {
             sim_recorder_free_buffers();
             fclose(stream);
@@ -253,9 +287,9 @@ bool sim_recorder_start(const char* path, int fps, int divisor, char* error, siz
 
     recorder.writer = furi_thread_alloc_ex("sim_recorder", 8 * 1024, sim_recorder_writer, NULL);
 
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
     recorder.running = true;
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 
     furi_thread_start(recorder.writer);
 
@@ -265,10 +299,10 @@ bool sim_recorder_start(const char* path, int fps, int divisor, char* error, siz
 }
 
 bool sim_recorder_stop(SimRecorderStatus* status, char* error, size_t error_size) {
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
     const bool running = recorder.running;
     recorder.running = false;
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 
     if(!running) {
         snprintf(error, error_size, "not recording");
@@ -278,17 +312,17 @@ bool sim_recorder_stop(SimRecorderStatus* status, char* error, size_t error_size
     /* The SDL thread may be part-way through reading a frame back into a pool
      * buffer; the pool cannot be freed under it. */
     for(int waited = 0; waited < SIM_RECORDER_SETTLE_MS; waited += 5) {
-        pthread_mutex_lock(&recorder.lock);
+        sim_recorder_lock();
         const bool filling = recorder.filling >= 0;
-        pthread_mutex_unlock(&recorder.lock);
+        sim_recorder_unlock();
 
         if(!filling) break;
         furi_delay_ms(5);
     }
 
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
     recorder.writer_stop = true;
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 
     furi_thread_join(recorder.writer);
     furi_thread_free(recorder.writer);
@@ -314,7 +348,7 @@ bool sim_recorder_stop(SimRecorderStatus* status, char* error, size_t error_size
 }
 
 void sim_recorder_status(SimRecorderStatus* status) {
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
     status->running = recorder.running;
     status->frames = recorder.frames;
     status->dropped = recorder.dropped;
@@ -322,13 +356,13 @@ void sim_recorder_status(SimRecorderStatus* status) {
     status->height = recorder.height;
     status->fps = recorder.fps;
     status->elapsed_ms = (unsigned)(recorder.last_frame_ms - recorder.first_frame_ms);
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 }
 
 uint8_t* sim_recorder_frame_due(int canvas_width, int canvas_height, uint64_t now_ms) {
     uint8_t* frame = NULL;
 
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
 
     if(!recorder.running || recorder.filling >= 0) goto out;
 
@@ -360,12 +394,12 @@ uint8_t* sim_recorder_frame_due(int canvas_width, int canvas_height, uint64_t no
     recorder.last_frame_ms = now_ms;
 
 out:
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
     return frame;
 }
 
 void sim_recorder_frame_ready(void) {
-    pthread_mutex_lock(&recorder.lock);
+    sim_recorder_lock();
 
     const int index = recorder.filling;
     recorder.filling = -1;
@@ -382,5 +416,5 @@ void sim_recorder_frame_ready(void) {
         }
     }
 
-    pthread_mutex_unlock(&recorder.lock);
+    sim_recorder_unlock();
 }
