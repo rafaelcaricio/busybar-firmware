@@ -44,6 +44,18 @@ COLOR_FORMAT = ColorFormat.ARGB8888
 
 MANIFEST_NAME = ".simulator-generated-files"
 
+# Runtime data written by simulator versions that predate the state overlay.
+# None of these paths is a generated input; leaving one in the asset root would
+# make supposedly immutable state visible to every future simulator run.
+LEGACY_MUTABLE_PATHS = (
+    "data",
+    "bkp",
+    "assets",
+    "ext/user_assets",
+    "ext/apps_data",
+    "ext/update",
+)
+
 
 def convert_sounds(
     source_dir: Path, target_dir: Path, expected: set[Path]
@@ -193,6 +205,21 @@ def copy_app_resources(root: Path, expected: set[Path]) -> int:
 
 
 def prepare_output_root(root: Path) -> None:
+    removed = []
+    for relative in LEGACY_MUTABLE_PATHS:
+        target = root / relative
+        if not target.exists() and not target.is_symlink():
+            continue
+
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        removed.append(relative)
+
+    if removed:
+        print(f"removed legacy mutable asset state: {', '.join(removed)}")
+
     manifest = root / MANIFEST_NAME
     if manifest.exists():
         return

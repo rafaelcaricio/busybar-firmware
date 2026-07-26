@@ -209,6 +209,19 @@ bool storage_host_init(const char* assets_root, const char* state_root) {
         return false;
     }
 
+    /* /ext is a mounted filesystem root on the device. The immutable asset
+     * layer makes it visible for reads, but write-side mkdir/open calls resolve
+     * only into the overlay. Materialize the mount point before firmware
+     * services start so their ordinary one-level mkdir calls behave exactly as
+     * they do against a mounted SD card. */
+    char external_root[PATH_MAX];
+    if(!storage_host_state_candidate(
+           STORAGE_EXT_PATH_PREFIX, external_root, sizeof(external_root), false) ||
+       !storage_host_mkdir_path(external_root)) {
+        FURI_LOG_E(TAG, "could not initialize writable %s mount", STORAGE_EXT_PATH_PREFIX);
+        return false;
+    }
+
     FURI_LOG_I(TAG, "assets: %s", storage_host_assets);
     FURI_LOG_I(TAG, "state: %s", storage_host_state);
 

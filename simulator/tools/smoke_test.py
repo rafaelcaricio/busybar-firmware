@@ -103,9 +103,15 @@ def reserve_port() -> int:
         return listener.getsockname()[1]
 
 
-def api_request(port: int, path: str, method: str = "GET") -> tuple[int, str]:
+def api_request(
+    port: int,
+    path: str,
+    method: str = "GET",
+    data: bytes | None = None,
+) -> tuple[int, str]:
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
+        data=data,
         method=method,
     )
     try:
@@ -251,6 +257,32 @@ def check_live_api(binary: Path, assets: Path, root: Path) -> None:
             if code != 200:
                 fail(f"input API returned HTTP {code}")
 
+            # A real device always has /ext mounted before the web service
+            # creates /ext/user_assets. A pristine overlay must expose the
+            # same invariant without a developer pre-creating directories.
+            external_state = state / "ext"
+            user_assets = external_state / "user_assets"
+            if not user_assets.is_dir():
+                fail("writable /ext/user_assets was not initialized automatically")
+
+            upload_data = b"simulator asset upload smoke test\n"
+            upload_app = "simulator-smoke"
+            upload_name = "fixture.anim"
+            upload_query = urllib.parse.urlencode(
+                {"application_name": upload_app, "file": upload_name}
+            )
+            code, _ = api_request(
+                port,
+                f"/api/assets/upload?{upload_query}",
+                method="POST",
+                data=upload_data,
+            )
+            uploaded = user_assets / upload_app / upload_name
+            if code != 200 or not uploaded.is_file() or uploaded.read_bytes() != upload_data:
+                fail(f"asset upload failed on pristine state with HTTP {code}")
+            if (assets / "ext" / "user_assets" / upload_app / upload_name).exists():
+                fail("asset upload mutated the immutable base")
+
             base_font = (
                 assets
                 / "ext"
@@ -272,12 +304,11 @@ def check_live_api(binary: Path, assets: Path, root: Path) -> None:
             victim.mkdir()
             sentinel = victim / "sentinel"
             sentinel.touch()
-            (state / "ext").mkdir()
-            os.symlink(victim, state / "ext" / "escape")
+            os.symlink(victim, external_state / "escape")
 
             query = urllib.parse.urlencode({"path": "/ext/escape"})
             code, _ = api_request(port, f"/api/storage/remove?{query}", method="DELETE")
-            if code != 200 or not sentinel.is_file() or (state / "ext" / "escape").exists():
+            if code != 200 or not sentinel.is_file() or (external_state / "escape").exists():
                 fail("recursive storage removal followed or failed to unlink a directory symlink")
 
             before_capture = control_request(control_path, "status")

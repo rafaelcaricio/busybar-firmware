@@ -129,6 +129,7 @@ Read the relevant section of `simulator/README.md` first. Keep these invariants:
 - Generated files and assets are build outputs with complete dependencies;
   never require developers to remember a manual reconfigure.
 - Base assets are immutable. All runtime writes go to the contained state
-  overlay, and recursive operations must never follow symlinks out of it.
+  overlay, `/ext` is initialized automatically before services start, and
+  recursive operations must never follow symlinks out of it.
 - Finish with a clean build, CTest, a driven capture that you inspect, and a
   log check.

@@ -86,10 +86,10 @@ if any of them is empty.
 The CTest smoke regression is headless and end to end: it boots applications,
 waits on rendered-frame revisions, exercises the real HTTP API, checks all five
 PNG dimensions at a large window scale, verifies capture does not consume the
-furi heap, checks immutable-storage containment, injects a signed low-battery
-state, and restarts against the same overlay to prove brightness and timezone
-persistence. `.github/workflows/simulator.yml` runs that path on macOS and
-Ubuntu.
+furi heap, uploads an asset into pristine state, checks immutable-storage
+containment, injects a signed low-battery state, and restarts against the same
+overlay to prove brightness and timezone persistence.
+`.github/workflows/simulator.yml` runs that path on macOS and Ubuntu.
 
 Options:
 
@@ -121,7 +121,9 @@ tree CMake builds under `build/assets_root`, which mirrors the device layout so
 `/ext/apps_assets/shared/fonts/...` and `/ext/apps_assets/clock/images/...`
 both resolve. `BUSYBAR_SIM_STATE` supplies a persistent writable overlay, and
 `--state-dir` takes precedence. Without either, each run gets isolated
-temporary state.
+temporary state. The simulator creates the writable `/ext` mount point before
+firmware services start; asset uploads and storage writes never require
+pre-creating workstation directories.
 
 The tree carries two kinds of file. Most are build products — fonts, `.image`,
 `.anim`, `.snd` — converted from `assets/` by `tools/gen_runtime_assets.py`.
@@ -130,6 +132,9 @@ which mirrors `/ext` below itself: the Busy app's themes are
 `applications/main/busy/resources/apps_assets/busy/themes/<name>/theme.json`,
 and each `theme.json` points at a background animation the converters produce.
 Both halves have to be there or the theme picker offers only `BUSY`.
+Rebuilding also removes mutable `data`, `user_assets`, `apps_data` and update
+state left inside `assets_root` by simulator versions from before the writable
+overlay; generated base assets remain immutable.
 
 ## Controls
 
