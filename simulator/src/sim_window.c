@@ -15,6 +15,7 @@
 #include <furi.h>
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +92,55 @@ static struct {
     size_t key_head;
     size_t key_tail;
 } sim;
+
+/*
+ * The FreeRTOS POSIX port preempts its task pthreads with SIGALRM. A task must
+ * not be switched out while it owns a host pthread mutex: the next FreeRTOS
+ * task can block on that mutex while the scheduler believes it is the running
+ * task, leaving the owner parked indefinitely.
+ *
+ * This is not theoretical here. The macOS hang report caught the input task at
+ * the return boundary of pthread_mutex_unlock(), suspended in the tick handler,
+ * while the SDL and GUI threads both waited on this lock. Keep the tick masked
+ * through the complete host mutex transaction. The previous mask is per
+ * pthread so callers that already disabled the tick stay disabled afterwards.
+ */
+static _Thread_local sigset_t sim_window_previous_signal_mask;
+
+static void sim_window_lock(void) {
+    sigset_t tick_signal;
+    sigemptyset(&tick_signal);
+    sigaddset(&tick_signal, SIGALRM);
+
+    int error =
+        pthread_sigmask(SIG_BLOCK, &tick_signal, &sim_window_previous_signal_mask);
+    if(error != 0) {
+        fprintf(stderr, "[sim] pthread_sigmask(SIG_BLOCK) failed: %s\n", strerror(error));
+        abort();
+    }
+
+    error = pthread_mutex_lock(&sim.lock);
+    if(error != 0) {
+        (void)pthread_sigmask(SIG_SETMASK, &sim_window_previous_signal_mask, NULL);
+        fprintf(stderr, "[sim] pthread_mutex_lock failed: %s\n", strerror(error));
+        abort();
+    }
+}
+
+static void sim_window_unlock(void) {
+    const int unlock_error = pthread_mutex_unlock(&sim.lock);
+    const int mask_error =
+        pthread_sigmask(SIG_SETMASK, &sim_window_previous_signal_mask, NULL);
+
+    if(unlock_error != 0) {
+        fprintf(stderr, "[sim] pthread_mutex_unlock failed: %s\n", strerror(unlock_error));
+        abort();
+    }
+    if(mask_error != 0) {
+        fprintf(stderr, "[sim] pthread_sigmask(SIG_SETMASK) failed: %s\n", strerror(mask_error));
+        abort();
+    }
+}
 
 /** Physical buttons the device has, mapped onto a keyboard. */
 static uint8_t sim_window_map_key(SDL_Keycode code) {
@@ -302,30 +352,30 @@ void sim_window_deinit(void) {
 }
 
 void sim_window_submit_front(const uint8_t* pixels) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     memcpy(sim.front_pixels, pixels, sizeof(sim.front_pixels));
     sim.front_dirty = true;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 }
 
 void sim_window_submit_back(const uint8_t* pixels) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     memcpy(sim.back_pixels, pixels, sizeof(sim.back_pixels));
     sim.back_dirty = true;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 }
 
 void sim_window_set_front_blanked(bool blanked) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     sim.front_blanked = blanked;
     sim.front_dirty = true;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 }
 
 bool sim_window_poll_key(uint8_t* key, bool* pressed) {
     bool available = false;
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     if(sim.key_tail != sim.key_head) {
         const KeyEvent event = sim.keys[sim.key_tail];
         sim.key_tail = (sim.key_tail + 1) % KEY_QUEUE_SIZE;
@@ -333,7 +383,7 @@ bool sim_window_poll_key(uint8_t* key, bool* pressed) {
         *pressed = event.pressed;
         available = true;
     }
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     return available;
 }
@@ -343,7 +393,7 @@ static void sim_window_upload(void) {
     uint8_t back_rgb[BACK_DISPLAY_W * BACK_DISPLAY_H * 3];
     bool front_dirty, back_dirty;
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     front_dirty = sim.front_dirty;
     back_dirty = sim.back_dirty;
 
@@ -366,7 +416,7 @@ static void sim_window_upload(void) {
         }
         sim.back_dirty = false;
     }
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     if(front_dirty) {
         SDL_UpdateTexture(sim.front_texture, NULL, front_rgb, FRONT_DISPLAY_W * 3);
@@ -389,10 +439,10 @@ static void sim_window_layout(SimLayout* layout) {
     int canvas_w = 0, canvas_h = 0;
     SDL_GetRendererOutputSize(sim.renderer, &canvas_w, &canvas_h);
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     sim.canvas_w = canvas_w;
     sim.canvas_h = canvas_h;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     const int deck_h = sim_controls_preferred_height(canvas_w);
 
@@ -443,9 +493,9 @@ static void sim_window_layout(SimLayout* layout) {
 bool sim_window_pump(void) {
     SDL_Event event;
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     const bool quit = sim.quit_requested;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
     if(quit) return false;
 
     while(SDL_PollEvent(&event)) {
@@ -467,9 +517,9 @@ bool sim_window_pump(void) {
 
             const uint8_t key = sim_window_map_key(event.key.keysym.sym);
             if(key != InputKeyMAX) {
-                pthread_mutex_lock(&sim.lock);
+                sim_window_lock();
                 sim_window_set_key(key, event.type == SDL_KEYDOWN);
-                pthread_mutex_unlock(&sim.lock);
+                sim_window_unlock();
             }
 
         } else if(event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
@@ -484,29 +534,29 @@ bool sim_window_pump(void) {
             const int y = window_h ? event.button.y * canvas_h / window_h : event.button.y;
 
             if(sim_controls_hit(x, y, &key)) {
-                pthread_mutex_lock(&sim.lock);
+                sim_window_lock();
                 sim.mouse_key = key;
                 sim.mouse_down = true;
                 sim_window_set_key(key, true);
-                pthread_mutex_unlock(&sim.lock);
+                sim_window_unlock();
             }
 
         } else if(event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
-            pthread_mutex_lock(&sim.lock);
+            sim_window_lock();
             if(sim.mouse_down) {
                 sim_window_set_key(sim.mouse_key, false);
                 sim.mouse_down = false;
             }
-            pthread_mutex_unlock(&sim.lock);
+            sim_window_unlock();
 
         } else if(event.type == SDL_MOUSEWHEEL) {
             /* The dial is an encoder; a wheel notch is one scroll step. */
             const uint8_t key = event.wheel.y > 0 ? SIM_KEY_SCROLL_UP : SIM_KEY_SCROLL_DOWN;
             if(event.wheel.y != 0) {
-                pthread_mutex_lock(&sim.lock);
+                sim_window_lock();
                 sim_window_push_key(key, true);
                 sim_window_push_key(key, false);
-                pthread_mutex_unlock(&sim.lock);
+                sim_window_unlock();
             }
         }
     }
@@ -533,14 +583,14 @@ bool sim_window_pump(void) {
     sim_led_panel_render(sim.front_leds, sim.front_texture, &layout.front_display);
     SDL_RenderCopy(sim.renderer, sim.back_texture, NULL, &layout.back_display);
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     bool held[InputKeyMAX];
     memcpy(held, sim.key_held, sizeof(held));
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     sim_controls_render(sim.renderer, held);
     /* Read back before presenting: after the swap the target is undefined. */
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     if(sim.window_capture_pending && sim.window_capture) {
         const SDL_Rect area = {0, 0, sim.window_capture_w, sim.window_capture_h};
         SDL_RenderReadPixels(
@@ -552,7 +602,7 @@ bool sim_window_pump(void) {
         sim.window_capture_pending = false;
         sim.window_capture_done = true;
     }
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     /* A recording reads the same finished frame back, into buffers the
      * recorder allocated when it started: nothing here allocates, and a frame
@@ -648,37 +698,37 @@ void sim_window_request_selftest(void) {
 }
 
 void sim_window_request_screenshot(void) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     sim.screenshot_pending = true;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 }
 
 bool sim_window_take_screenshot_request(void) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     const bool pending = sim.screenshot_pending;
     sim.screenshot_pending = false;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     return pending;
 }
 
 void sim_window_inject_key(uint8_t key, bool pressed) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     sim_window_set_key(key, pressed);
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 }
 
 void sim_window_request_quit(void) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     sim.quit_requested = true;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 }
 
 void sim_window_canvas_size(int* width, int* height) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     *width = sim.canvas_w;
     *height = sim.canvas_h;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 }
 
 /** Build "<directory>/<name>.png", numbered when @p sequence is not zero. */
@@ -700,31 +750,31 @@ static void sim_window_capture_path(
  * Unlike the per-panel images this shows the device and the layout around the
  * panels, which is the only way to check the window presentation. */
 static void sim_window_capture_window(const char* directory, unsigned sequence) {
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     const int width = sim.canvas_w;
     const int height = sim.canvas_h;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     if(width <= 0 || height <= 0) return;
 
     uint8_t* pixels = malloc((size_t)width * height * 3);
     if(!pixels) return;
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     sim.window_capture = pixels;
     sim.window_capture_w = width;
     sim.window_capture_h = height;
     sim.window_capture_done = false;
     sim.window_capture_pending = true;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     /* The SDL thread fills this on its next present. */
     bool done = false;
     for(int attempt = 0; attempt < 100 && !done; attempt++) {
         furi_delay_ms(20);
-        pthread_mutex_lock(&sim.lock);
+        sim_window_lock();
         done = sim.window_capture_done;
-        pthread_mutex_unlock(&sim.lock);
+        sim_window_unlock();
     }
 
     if(done) {
@@ -735,10 +785,10 @@ static void sim_window_capture_window(const char* directory, unsigned sequence) 
         fprintf(stderr, "[sim] window capture timed out\n");
     }
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     sim.window_capture = NULL;
     sim.window_capture_pending = false;
-    pthread_mutex_unlock(&sim.lock);
+    sim_window_unlock();
 
     free(pixels);
 }
@@ -746,8 +796,10 @@ static void sim_window_capture_window(const char* directory, unsigned sequence) 
 void sim_window_screenshot(const char* directory, unsigned sequence) {
     uint8_t front_rgb[sizeof(sim.front_pixels)];
     uint8_t back_rgb[BACK_DISPLAY_W * BACK_DISPLAY_H * 3];
+    int front_scale;
+    int back_scale;
 
-    pthread_mutex_lock(&sim.lock);
+    sim_window_lock();
     /* Swap to RGB for the encoder; the panel buffer is BGR. */
     for(size_t i = 0; i < sizeof(front_rgb); i += 3) {
         front_rgb[i + 0] = sim.front_pixels[i + 2];
@@ -760,15 +812,17 @@ void sim_window_screenshot(const char* directory, unsigned sequence) {
         back_rgb[i * 3 + 1] = level;
         back_rgb[i * 3 + 2] = level;
     }
-    pthread_mutex_unlock(&sim.lock);
+    front_scale = sim.front_scale;
+    back_scale = sim.back_scale;
+    sim_window_unlock();
 
     char path[1024];
 
     sim_window_capture_path(path, sizeof(path), directory, "front", sequence);
-    sim_window_write_png(path, front_rgb, FRONT_DISPLAY_W, FRONT_DISPLAY_H, sim.front_scale);
+    sim_window_write_png(path, front_rgb, FRONT_DISPLAY_W, FRONT_DISPLAY_H, front_scale);
 
     sim_window_capture_path(path, sizeof(path), directory, "back", sequence);
-    sim_window_write_png(path, back_rgb, BACK_DISPLAY_W, BACK_DISPLAY_H, sim.back_scale);
+    sim_window_write_png(path, back_rgb, BACK_DISPLAY_W, BACK_DISPLAY_H, back_scale);
 
     sim_window_capture_window(directory, sequence);
 
