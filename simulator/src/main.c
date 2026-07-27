@@ -16,6 +16,7 @@
 #include "discovery_host.h"
 #include "display_host.h"
 #include "input_host.h"
+#include "light_sensor_host.h"
 #include "platform_services_host.h"
 #include "scene_host.h"
 #include "services_host.h"
@@ -27,6 +28,7 @@
 #include <furi.h>
 #include <furi_hal_resources.h>
 
+#include <brightness_control/brightness_control.h>
 #include <storage/storage.h>
 
 #include <FreeRTOS.h>
@@ -325,11 +327,20 @@ static int32_t simulator_init_thread(void* arg) {
     font_registry_startup(NULL);
     services_host_init();
     platform_services_host_init();
+    light_sensor_host_init();
     simulator_mark_setup_complete();
 
     FuriThread* brightness =
         furi_thread_alloc_ex("brightness", 8 * 1024, brightness_control_srv, NULL);
     furi_thread_start(brightness);
+
+    /* Opening the record waits until brightness_control_alloc() has subscribed
+     * to the light sensor. Publishing afterward guarantees that the normal
+     * firmware event path, rather than a simulator display hook, raises a
+     * fresh auto-brightness setting to 100%. */
+    furi_record_open(RECORD_BRIGHTNESS_CONTROL);
+    light_sensor_host_publish_max();
+    furi_record_close(RECORD_BRIGHTNESS_CONTROL);
 
     FuriThread* gui = furi_thread_alloc_ex("gui", 16 * 1024, gui_srv, NULL);
     furi_thread_start(gui);

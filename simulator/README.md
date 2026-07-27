@@ -41,11 +41,12 @@ available explicitly with `--network` or `--mdns`.
 What is faked: the two display drivers push pixels into an SDL texture instead
 of SPI, an on-screen control deck and the keyboard stand in for the buttons,
 storage is an immutable generated tree plus a writable workstation overlay, and
-the RTC starts from the workstation clock. Brightness and timezone settings use
-the firmware's real services and persist in that overlay. Everything needing a
-radio or a remote server — Wi-Fi, BLE, Matter, MQTT, OTA — remains an inert
-stand-in. See `shim/` and `src/`, and "What the apps are talking to" below for
-which is which.
+the RTC starts from the workstation clock. The simulated light sensor reports a
+bright environment at startup, making the firmware's automatic-brightness path
+raise the displays to 100%. Brightness and timezone settings use the firmware's
+real services and persist in that overlay. Everything needing a radio or a
+remote server — Wi-Fi, BLE, Matter, MQTT, OTA — remains an inert stand-in. See
+`shim/` and `src/`, and "What the apps are talking to" below for which is which.
 
 ## Build and run
 
@@ -377,13 +378,15 @@ workstation's sound device (see below).
 
 **Substituted.** Displays go to SDL and apply the firmware's requested front
 brightness, back contrast and sleep state; buttons come from the control deck.
-Storage is a read-only generated asset tree layered under a writable state
-directory. The RTC begins at UTC host time, observes API-set offsets, and the
-time service applies the configured timezone. Power is a thread-safe host
-model whose charge/USB/charging states can be injected through `simctl.py
-power`. The HTTP API is the firmware's own server on host sockets rather than
-lwIP; `src/web_api_host.c` answers for the network stack and load estimator,
-and opt-in discovery uses the platform's mDNS responder.
+The host light sensor publishes a maximum-level firmware event at startup, so
+the real automatic-brightness service selects 100%. Storage is a read-only
+generated asset tree layered under a writable state directory. The RTC begins
+at UTC host time, observes API-set offsets, and the time service applies the
+configured timezone. Power is a thread-safe host model whose
+charge/USB/charging states can be injected through `simctl.py power`. The HTTP
+API is the firmware's own server on host sockets rather than lwIP;
+`src/web_api_host.c` answers for the network stack and load estimator, and
+opt-in discovery uses the platform's mDNS responder.
 
 **Inert.** `src/platform_services_host.c` stands in for everything that needs a
 radio or a server: Wi-Fi, BLE, Matter, MQTT, the OTA updater, status lights and

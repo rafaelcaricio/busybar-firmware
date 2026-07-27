@@ -208,6 +208,14 @@ def check_live_api(binary: Path, assets: Path, root: Path) -> None:
             if renderer is None:
                 fail("control socket did not report rendered displays")
 
+            if (
+                wait_for_api_value(
+                    port, "/api/display/brightness", "value", "auto"
+                )
+                != "auto"
+            ):
+                fail("fresh simulator did not start in automatic brightness mode")
+
             target = renderer[0] + 2
             waited = control_request(control_path, f"wait frame {target} 5000")
             if len(waited) != 1 or int(waited[0]) < target:
@@ -506,6 +514,8 @@ def main() -> int:
             fail("headless simulator emitted an error log", output)
         if "control selftest: pass" not in output:
             fail("control hitbox self-test did not pass", output)
+        if "Light sensor brightness: 10" not in output:
+            fail("simulated max-light event did not reach brightness control", output)
 
         if png_size(shots / "front-raw.png") != (72, 16):
             fail("raw front capture does not match the physical panel")

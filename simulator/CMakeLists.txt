@@ -867,6 +867,9 @@ target_compile_definitions(busybar-sim PRIVATE
     FURI_DEBUG
     # Makes gui.c subscribe to the input pubsub that src/input_host.c creates.
     SRV_INPUT
+    # Keeps automatic brightness enabled in the real brightness service; the
+    # host light sensor publishes the same max-level event as device hardware.
+    SRV_LIGHT_SENSOR
     BUSYBAR_SIM_HEAP_SIZE=${BUSYBAR_SIM_HEAP_SIZE_BYTES}
     BUSYBAR_SIM_DEFAULT_ASSETS="${ASSETS_ROOT}"
     # web_server_i.h asserts that its ConnectionContext fits mongoose's per
